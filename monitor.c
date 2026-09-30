@@ -1,0 +1,66 @@
+/* monitor.c — 显示器查询 */
+#include "winmover.h"
+
+int GetMonitorCount(void) {
+    return GetSystemMetrics(SM_CMONITORS);
+}
+
+/* ─── 枚举回调 ────────────────────────────────────── */
+typedef struct {
+    HMONITOR result;
+    int      findPrimary;
+} MonEnumCtx;
+
+static BOOL CALLBACK EnumFindMon(HMONITOR hMon, HDC hdc, LPRECT rc, LPARAM lp) {
+    (void)hdc; (void)rc;
+    MonEnumCtx *ctx = (MonEnumCtx *)lp;
+    MONITORINFO mi = {sizeof(mi)};
+    if (!GetMonitorInfoA(hMon, &mi)) return TRUE;
+    if (ctx->findPrimary) {
+        if (mi.dwFlags & MONITORINFOF_PRIMARY) {
+            ctx->result = hMon;
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+HMONITOR GetPrimaryMonitorHandle(void) {
+    MonEnumCtx ctx = {NULL, 1};
+    EnumDisplayMonitors(NULL, NULL, EnumFindMon, (LPARAM)&ctx);
+    return ctx.result;
+}
+
+int IsPrimaryMonitor(HMONITOR hMon) {
+    return hMon == GetPrimaryMonitorHandle();
+}
+
+HMONITOR GetMonitorFromWindowEx(HWND hWnd) {
+    return MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST);
+}
+
+HMONITOR GetMonitorFromPointEx(int x, int y) {
+    POINT pt = {x, y};
+    return MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+}
+
+int GetMonitorRect(HMONITOR hMon, RECT *rc) {
+    MONITORINFO mi = {sizeof(mi)};
+    if (!GetMonitorInfoA(hMon, &mi)) return 0;
+    *rc = mi.rcMonitor;
+    return 1;
+}
+
+int GetMonitorWorkRect(HMONITOR hMon, RECT *rc) {
+    MONITORINFO mi = {sizeof(mi)};
+    if (!GetMonitorInfoA(hMon, &mi)) return 0;
+    *rc = mi.rcWork;
+    return 1;
+}
+
+int GetMonitorScale(HMONITOR hMon) {
+    if (IsPrimaryMonitor(hMon))
+        return g_primaryScale;
+    else
+        return g_secondaryScale;
+}
