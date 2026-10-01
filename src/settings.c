@@ -26,6 +26,43 @@ static UiWidget g_wStartup, g_wManualOvr, g_wManualAct, g_wTaskbar,
                 g_wSideL, g_wSideR,
                 g_wSave, g_wRestore;
 
+/* ─── 亮度写入：DDC/CI 很慢（枚举显示器 + 每显示器 I2C 事务），写 INI 又是磁盘
+ *     I/O，二者都不能放在拖动滑块的每一帧里。这里用后台线程 + 事件去抖：
+ *     滑块变化只更新界面，用户停手 ~220ms 后才真正写硬件。 */
+static HANDLE        g_brightEvt    = NULL;
+static HANDLE        g_brightThread = NULL;
+static volatile LONG g_brightStop   = 0;
+
+static DWORD WINAPI BrightWorker(LPVOID param) {
+    (void)param;
+    while (!g_brightStop) {
+        if (WaitForSingleObject(g_brightEvt, INFINITE) != WAIT_OBJECT_0) break;
+        if (g_brightStop) break;
+        ResetEvent(g_brightEvt);
+        /* 去抖：220ms 内又有新值就继续等，直到用户停手 */
+        while (WaitForSingleObject(g_brightEvt, 220) == WAIT_OBJECT_0) {
+            ResetEvent(g_brightEvt);
+            if (g_brightStop) break;
+        }
+        if (g_brightStop) break;
+        if (g_cfg.SavedBrightness >= 0) {
+            SetSecondaryBrightness(g_cfg.SavedBrightness);
+            SaveConfig();
+        }
+    }
+    return 0;
+}
+
+static void StopBrightWorker(void) {
+    if (g_brightEvt) { g_brightStop = 1; SetEvent(g_brightEvt); }
+    if (g_brightThread) {
+        WaitForSingleObject(g_brightThread, 1500);
+        CloseHandle(g_brightThread);
+        g_brightThread = NULL;
+    }
+    if (g_brightEvt) { CloseHandle(g_brightEvt); g_brightEvt = NULL; }
+}
+
 /* ─── 状态行 / 亮度：把展示态写入页面（只推 int / bool） ─── */
 static void PushDisplayState(void) {
     int monCnt = GetMonitorCount();
@@ -125,10 +162,9 @@ static void OnBrightness(UiWidget w, float value, void* ud) {
     if (v > 100) v = 100;
     if (v == g_cfg.SavedBrightness) return;
     g_cfg.SavedBrightness = v;
-    SetSecondaryBrightness(v);
-    SaveConfig();
-    ui_page_set_int(g_page, "brightness", v);
+    ui_page_set_int(g_page, "brightness", v);   /* 只更新界面，不碰硬件 */
     ui_page_set_bool(g_page, "saved", 0);
+    if (g_brightEvt) SetEvent(g_brightEvt);      /* 通知后台线程去抖写入 */
 }
 
 /* 保存：读回所有控件 → g_cfg → INI */
@@ -174,6 +210,12 @@ static void OnRestore(UiWidget w, void* ud) {
 /* 窗口关闭：复位全局标记 */
 static void OnWindowClose(UiWindow win, void* ud) {
     (void)win; (void)ud;
+    StopBrightWorker();
+    /* 关窗前把最后一步亮度落地（去抖可能还没触发） */
+    if (g_cfg.SavedBrightness >= 0) {
+        SetSecondaryBrightness(g_cfg.SavedBrightness);
+        SaveConfig();
+    }
     g_guiHwnd     = NULL;
     g_guiOpenFlag = 0;
 }
@@ -242,7 +284,7 @@ int RunSettingsGui(HINSTANCE hInst, int nCmdShow) {
         return 1;
     }
 
-    g_win = ui_page_open_window(g_page, NULL);
+    g_win = ui_page_prepare_window(g_page, NULL);   /* 隐藏窗 + 预热 RT，随后无动画显示 */
     if (!g_win) {
         ui_page_destroy(g_page);
         g_page = 0;
@@ -251,6 +293,17 @@ int RunSettingsGui(HINSTANCE hInst, int nCmdShow) {
         return 1;
     }
     g_guiHwnd = (HWND)ui_window_hwnd(g_win);
+
+    /* 原生标题栏跟随深色主题（显示前设置，避免闪白） */
+    {
+        BOOL dark = TRUE;
+        DwmSetWindowAttribute(g_guiHwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+    }
+
+    /* 启动亮度后台写入线程 */
+    g_brightStop   = 0;
+    g_brightEvt    = CreateEventA(NULL, TRUE, FALSE, NULL);   /* manual-reset：天然合并多次触发 */
+    g_brightThread = CreateThread(NULL, 0, BrightWorker, NULL, 0, NULL);
 
     ResolveWidgets();
     if (!g_wStartup || !g_wManualOvr || !g_wManualAct || !g_wTaskbar ||
@@ -270,7 +323,10 @@ int RunSettingsGui(HINSTANCE hInst, int nCmdShow) {
     WireWidgets();
     ui_window_on_close(g_win, OnWindowClose, NULL);
 
+    ui_window_show_immediate(g_win);   /* 一次性出图，跳过开场淡入 */
     ui_run();
+
+    StopBrightWorker();   /* 幂等：OnWindowClose 已停则此处 no-op */
 
     g_guiHwnd     = NULL;
     g_guiOpenFlag = 0;

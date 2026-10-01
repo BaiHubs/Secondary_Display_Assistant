@@ -51,16 +51,14 @@ void UpdateActiveState(void) {
 
 /* ─── 设置界面入口（单进程复用已开窗口） ─────────────── */
 void OpenSettingsGui(void) {
-    if (g_guiOpenFlag) {
-        if (g_guiHwnd && IsWindow(g_guiHwnd)) {
-            SetForegroundWindow(g_guiHwnd);
-            return;
-        }
-        g_guiOpenFlag = 0;
-    }
-    /* 运行内建的设置界面 */
-    RunSettingsGui(g_hInst, SW_SHOW);
-    g_guiOpenFlag = 1;
+    /* 以独立进程启动设置界面：
+       - core-ui 需要"干净的"进程来设置 Per-Monitor DPI V2（进程 DPI 感知只能设一次，
+         主进程已 SetProcessDPIAware，若在进程内跑 core-ui 会被降级为 System 感知）；
+       - 也避免与托盘的消息循环 / INI 轮询定时器（含 DDC/CI）共用 UI 线程。
+       单实例由子进程内部的互斥体 + 窗口查找保证。 */
+    char exe[MAX_PATH];
+    GetModuleFileNameA(NULL, exe, MAX_PATH);
+    ShellExecuteA(NULL, "open", exe, "--settings", NULL, SW_SHOWNORMAL);
 }
 
 /* ─── WinMain：程序入口 ──────────────────────────────── */
@@ -73,9 +71,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nCmdShow) 
 
     /* --settings 参数 → 直接运行设置界面 */
     if (lpCmd && lpCmd[0] && strstr(lpCmd, "--settings")) {
-        SetProcessDPIAware();
-        INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_STANDARD_CLASSES | ICC_BAR_CLASSES};
-        InitCommonControlsEx(&icc);
+        /* 刻意不在此调用 SetProcessDPIAware()：进程 DPI 感知只能设置一次，
+           留给 core-ui 自己设置 Per-Monitor V2，否则会被降级为 System 感知
+           导致渲染缩放错误、拖动发虚/卡顿。 */
         return RunSettingsGui(hInst, nCmdShow);
     }
 
