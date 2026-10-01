@@ -1,4 +1,11 @@
-/* config.c — INI 配置读写 */
+/* config.c — INI 配置读写
+ *
+ * 负责 WindowMove.ini 的读写，并把配置应用为运行时状态：
+ *   - IniReadInt() / IniWriteInt()  单个键值读写
+ *   - LoadConfig() / SaveConfig()   整体加载 / 保存
+ *   - ApplyConfigFromIni()          重新读取并应用（含开机自启注册表）
+ *   - CheckIniChanged()             监听 INI 变更（由定时器周期调用）
+ */
 #include "winmover.h"
 
 char g_lastIniTime[32] = "";

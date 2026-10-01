@@ -1,4 +1,13 @@
-/* monitor.c — 显示器查询 */
+/* monitor.c — 显示器查询
+ *
+ * 封装 Win32 多显示器相关查询：
+ *   - GetMonitorCount()           显示器数量
+ *   - GetPrimaryMonitorHandle()   主屏句柄（枚举查找）
+ *   - IsPrimaryMonitor()          是否主屏
+ *   - GetMonitorFromWindowEx/PointEx  由窗口/坐标取最近显示器
+ *   - GetMonitorRect/WorkRect     显示器全区域 / 工作区域
+ *   - GetMonitorScale()           显示器对应的 DPI 缩放百分比
+ */
 #include "winmover.h"
 
 int GetMonitorCount(void) {

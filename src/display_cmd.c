@@ -1,4 +1,9 @@
-/* display_cmd.c — 副屏方向控制（内联，无需外部 display_helper.exe） */
+/* display_cmd.c — 副屏方向控制（内联，无需外部 display_helper.exe）
+ *
+ * 通过 ChangeDisplaySettingsEx 调整副屏旋转方向与相对主屏的位置：
+ *   - GetCurrentOrientation()     读取副屏当前方向
+ *   - SetOrientationAndSide()     设置方向 + 左/右侧位置（先 CDS_TEST 校验）
+ */
 #include "winmover.h"
 
 /* ─── 获取副屏设备名（非主屏的那个） ───────────────── */

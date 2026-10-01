@@ -1,4 +1,11 @@
-/* brightness.c — DDC/CI 亮度控制（动态加载 dxva2.dll） */
+/* brightness.c — DDC/CI 亮度控制（动态加载 dxva2.dll）
+ *
+ * 通过 DDC/CI 读写副屏亮度：
+ *   - LoadDxva()                运行时加载 dxva2.dll 并取函数指针
+ *   - GetSecondaryBrightness()  读取副屏当前亮度
+ *   - SetSecondaryBrightness()  设置副屏亮度
+ * 仅作用于非主屏显示器（回调中过滤 MONITORINFOF_PRIMARY）。
+ */
 #include "winmover.h"
 
 #pragma pack(push, 8)

@@ -1,189 +1,39 @@
-/* winmover.c — 主程序：Shell Hook + 低层键盘钩子 + 热键 + 单进程 */
+/* switcher.c — 窗口切换器
+ *
+ * 包含两套切换 UI 与对外消息接口：
+ *   1) 旧版文本列表切换器 ShowMonitorSwitcher()（保留；当前主流程未调用）；
+ *   2) Alt+Tab 仿原生缩略图切换器（DWM 缩略图叠加窗口，
+ *      经 SwitcherStartFromHotkey() 或 WM_USER 系列消息驱动）。
+ *
+ * 对外接口（供 hotkeys.c / wndproc.c 使用）：
+ *   SwitcherHandleMessage() 处理 WM_USER+200 系列自定义消息
+ *   SwitcherStartFromHotkey() 热键唤起
+ */
 #include "winmover.h"
 
-Config  g_cfg;
-char    g_exeDir[MAX_PATH];
-char    g_iniPath[MAX_PATH];
-int     g_isActive        = 0;
-int     g_movingFlag      = 0;
-int     g_resizingFlag    = 0;
-int     g_taskbarMoveEnabled = 1;
-int     g_fullScreenMode  = 0;
-int     g_primaryScale    = 150;
-int     g_secondaryScale  = 125;
-HWND    g_guiHwnd         = NULL;
-int     g_guiOpenFlag     = 0;
-HINSTANCE g_hInst;
-HWND    g_hMainWnd;
+/* ─── 切换器自定义消息（发送给主窗口） ───────────────── */
+#define WM_SW_SHOW     (WM_USER + 200)   /* 请求显示切换器 */
+#define WM_SW_CYCLE    (WM_USER + 201)   /* 循环选择（wParam = ±1） */
+#define WM_SW_CONFIRM  (WM_USER + 202)   /* 确认选择 */
+#define WM_SW_CANCEL   (WM_USER + 203)   /* 取消 */
+#define WM_SW_DOSHOW   (WM_USER + 210)   /* 实际创建并显示叠加窗口 */
 
-static UINT      g_uShellHookMsg = 0;
-static int       g_switcherActive = 0;
-static POINT     g_swHookCursor = {0, 0};
+/* ─── 内部状态 ───────────────────────────────────────── */
+static int   g_switcherActive = 0;       /* 切换器是否处于激活状态 */
+static POINT g_swHookCursor   = {0, 0};  /* 唤起时的光标位置（决定目标屏） */
+
+/* ─── 切换器函数前向声明 ─────────────────────────────── */
 static void AltTabShow(void);
+static void AltTabCycle(int dir);
+static void AltTabConfirm(void);
+static void AltTabCancel(void);
 
-static void GetExeDir(void) {
-    GetModuleFileNameA(NULL, g_exeDir, MAX_PATH);
-    char *p = strrchr(g_exeDir, '\\');
-    if (p) *p = '\0';
-}
-
-void UpdateActiveState(void) {
-    g_isActive = g_cfg.ManualOverride
-                 ? g_cfg.ManualActive
-                 : (GetMonitorCount() >= 2);
-}
-
-/* ─── 设置界面入口（单进程） ─────────────────────────── */
-void OpenSettingsGui(void) {
-    if (g_guiOpenFlag) {
-        if (g_guiHwnd && IsWindow(g_guiHwnd)) {
-            SetForegroundWindow(g_guiHwnd);
-            return;
-        }
-        g_guiOpenFlag = 0;
-    }
-    /* 运行内建的设置界面 */
-    RunSettingsGui(g_hInst, SW_SHOW);
-    g_guiOpenFlag = 1;
-}
-
-/* ─── 热键（用 RegisterHotKey 替代钩子，零系统开销） ─ */
-#define IDH_DISPLAY   9001
-#define IDH_SWITCHER  9002
-#define IDH_ORIENT    9003
-
-/* ─── Shell Hook ──────────────────────────────────── */
-#define HSHELL_WINDOWCREATED   1
-#define HSHELL_WINDOWACTIVATED 4
-
-static int IsRealAppWindow(HWND hWnd) {
-    if (!IsWindow(hWnd)) return 0;
-    if (IsExcludedWindow(hWnd)) return 0;
-
-    /* 必须有可见标题栏 */
-    LONG style = GetWindowLongA(hWnd, GWL_STYLE);
-    if (!(style & WS_CAPTION)) return 0;
-    if (!(style & WS_VISIBLE)) return 0;
-
-    /* 必须有非空标题 */
-    char title[128];
-    if (!GetWindowTextA(hWnd, title, sizeof(title))) return 0;
-    if (title[0] == '\0') return 0;
-
-    /* 检查窗口类名 — 排除桌面和任务栏，保留文件资源管理器 */
-    char cls[64];
-    if (GetClassNameA(hWnd, cls, sizeof(cls))) {
-        if (strcmp(cls, "Progman") == 0 ||         /* 桌面 */
-            strcmp(cls, "WorkerW") == 0 ||           /* 桌面背景 */
-            strcmp(cls, "Shell_TrayWnd") == 0 ||     /* 任务栏 */
-            strcmp(cls, "Shell_SecondaryTrayWnd") == 0)
-            return 0;
-    }
-
-    /* 排除系统进程（保留 explorer.exe — 文件资源管理器可移动） */
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hWnd, &pid);
-    if (!pid) return 0;
-    HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (hp) {
-        char path[MAX_PATH]; DWORD sz = MAX_PATH;
-        if (QueryFullProcessImageNameA(hp, 0, path, &sz)) {
-            char *fn = strrchr(path, '\\');
-            fn = fn ? fn + 1 : path;
-            if (_stricmp(fn, "svchost.exe")  == 0 ||
-                _stricmp(fn, "rundll32.exe") == 0 ||
-                _stricmp(fn, "shellexperiencehost.exe") == 0) {
-                CloseHandle(hp);
-                return 0;
-            }
-        }
-        CloseHandle(hp);
-    }
-    return 1;
-}
-
-/* ─── 防抖：全局节流 + 前台窗口校验 ────────────────── */
-static DWORD g_lastActivationTick = 0;
-static DWORD g_lastDestroyTick    = 0;
-
-/* ─── 鼠标是否在任务栏附近（含预览弹窗区域） ──────── */
-
-static int IsCursorNearTaskbar(void) {
-    POINT pt;
-    GetCursorPos(&pt);
-    HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONULL);
-    if (!hMon) return 0;
-    MONITORINFO mi = {sizeof(mi)};
-    if (!GetMonitorInfo(hMon, &mi)) return 0;
-    const int MARGIN = 250; /* 预览弹窗可能出现在任务栏上方 250px 内 */
-    /* 底部任务栏 */
-    if (mi.rcWork.bottom < mi.rcMonitor.bottom &&
-        pt.y >= mi.rcWork.bottom - MARGIN && pt.y <= mi.rcMonitor.bottom + 1)
-        return 1;
-    /* 顶部任务栏 */
-    if (mi.rcWork.top > mi.rcMonitor.top &&
-        pt.y >= mi.rcMonitor.top - 1 && pt.y <= mi.rcWork.top + MARGIN)
-        return 1;
-    /* 左侧任务栏 */
-    if (mi.rcWork.left > mi.rcMonitor.left &&
-        pt.x >= mi.rcMonitor.left - 1 && pt.x <= mi.rcWork.left + MARGIN)
-        return 1;
-    /* 右侧任务栏 */
-    if (mi.rcWork.right < mi.rcMonitor.right &&
-        pt.x >= mi.rcWork.right - MARGIN && pt.x <= mi.rcMonitor.right + 1)
-        return 1;
-    return 0;
-}
-
-static void OnWindowCreated(HWND hWnd) {
-    if (!g_isActive) return;
-    if (!IsWindow(hWnd)) return;
-    if (IsExcludedWindow(hWnd)) return;
-    LONG s = GetWindowLongA(hWnd, GWL_STYLE);
-    if (!(s & WS_CAPTION)) return;
-    POINT pt;
-    GetCursorPos(&pt);
-    HMONITOR hMonMouse = GetMonitorFromPointEx(pt.x, pt.y);
-    DelayedMove(hWnd, hMonMouse);
-}
-
-/* ─── HSHELL_WINDOWACTIVATED ──────────────────────── */
-/* 简单可靠：用 shell hook 的 hWnd + GetForegroundWindow 回退验证 */
-static void OnWindowActivated(HWND hWnd) {
-    if (!g_isActive || !g_taskbarMoveEnabled || g_movingFlag) return;
-    if (GetTickCount() - g_lastActivationTick < 300) return;
-    if (GetTickCount() - g_lastDestroyTick < 200) return;
-
-    /* 验证：shell hook 的窗口必须是当前前台，否则用前台窗口替代 */
-    {
-        HWND fgWnd = GetForegroundWindow();
-        if (hWnd != fgWnd) hWnd = fgWnd;
-    }
-    if (!hWnd || !IsRealAppWindow(hWnd)) return;
-    if (!IsCursorNearTaskbar()) return;
-
-    POINT pt;
-    GetCursorPos(&pt);
-    HMONITOR hMonMouse = GetMonitorFromPointEx(pt.x, pt.y);
-    HMONITOR hMonWnd   = GetMonitorFromWindowEx(hWnd);
-    if (hMonWnd == hMonMouse) return;
-
-    g_lastActivationTick = GetTickCount();
-
-    if (IsIconic(hWnd)) {
-        ShowWindow(hWnd, SW_RESTORE);
-        Sleep(80);
-    }
-
-    g_movingFlag = 1;
-    MoveWindowToMonitor(hWnd, hMonMouse, g_fullScreenMode);
-    g_movingFlag = 0;
-}
-
-/* ─── 窗口切换器（Alt+Tab / Ctrl+Alt+Tab 增强叠加） ─── */
+/* ═══════════════════════════════════════════════════════
+ * 一、旧版文本列表切换器（ShowMonitorSwitcher）
+ * ═══════════════════════════════════════════════════════ */
 typedef struct { HWND hWnd; char title[256]; } WinEntry;
 
-/* 辅助：将窗口移到光标所在屏幕 */
+/* 辅助：将窗口移到光标所在屏幕（居中 800x600） */
 static void MoveWinToCursorMon(HWND hWnd) {
     POINT pt; GetCursorPos(&pt);
     HMONITOR hMonMouse = MonitorFromPoint(pt, MONITOR_DEFAULTTONULL);
@@ -281,7 +131,9 @@ void ShowMonitorSwitcher(void) {
     busy = 0;
 }
 
-/* ─── Alt+Tab 仿原生切换器（DWM 缩略图） ──────────── */
+/* ═══════════════════════════════════════════════════════
+ * 二、Alt+Tab 仿原生切换器（DWM 缩略图）
+ * ═══════════════════════════════════════════════════════ */
 #define THUMB_W 300
 #define THUMB_H 200
 #define TITLE_H 36
@@ -297,9 +149,7 @@ static int g_swCount = 0, g_swSel = 0;
 static HWND g_swHwnd = NULL;
 static HMONITOR g_swTargetMon = NULL;
 
-void AltTabConfirm(void);
-void AltTabCancel(void);
-
+/* 叠加窗口过程：绘制背景/选中框/标题/标签，处理鼠标与键盘 */
 static LRESULT CALLBACK SwitcherWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_PAINT) {
         PAINTSTRUCT ps; HDC hdc = BeginPaint(hWnd, &ps);
@@ -405,25 +255,26 @@ static LRESULT CALLBACK SwitcherWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
     if (msg == WM_KEYDOWN) {
         switch (wParam) {
         case VK_LEFT: case VK_UP:
-            PostMessageA(g_hMainWnd, WM_USER + 201, -1, 0); return 0;
+            PostMessageA(g_hMainWnd, WM_SW_CYCLE, -1, 0); return 0;
         case VK_RIGHT: case VK_DOWN:
-            PostMessageA(g_hMainWnd, WM_USER + 201, 1, 0); return 0;
+            PostMessageA(g_hMainWnd, WM_SW_CYCLE, 1, 0); return 0;
         case VK_RETURN: case VK_SPACE:
-            PostMessageA(g_hMainWnd, WM_USER + 202, 0, 0); return 0;
+            PostMessageA(g_hMainWnd, WM_SW_CONFIRM, 0, 0); return 0;
         case VK_ESCAPE:
-            PostMessageA(g_hMainWnd, WM_USER + 203, 0, 0); return 0;
+            PostMessageA(g_hMainWnd, WM_SW_CANCEL, 0, 0); return 0;
         }
         return 0;
     }
     if (msg == WM_ACTIVATE && LOWORD(wParam) == WA_INACTIVE) {
-        PostMessageA(g_hMainWnd, WM_USER + 203, 0, 0);
+        PostMessageA(g_hMainWnd, WM_SW_CANCEL, 0, 0);
         return 0;
     }
     if (msg == WM_ERASEBKGND) return 1;
     return DefWindowProcA(hWnd, msg, wParam, lParam);
 }
 
-void AltTabShow(void) {
+/* ─── 创建并显示切换器叠加窗口 ───────────────────────── */
+static void AltTabShow(void) {
     if (!g_cfg.SwitcherEnabled) { g_switcherActive = 0; return; }
     g_swCount = 0;
     HWND hWnd = GetTopWindow(NULL);
@@ -528,13 +379,14 @@ void AltTabShow(void) {
     InvalidateRect(g_swHwnd, NULL, TRUE);
 }
 
-void AltTabCycle(int dir) {
+/* ─── 循环移动选择 ───────────────────────────────────── */
+static void AltTabCycle(int dir) {
     g_swSel = (g_swSel + dir + g_swCount) % g_swCount;
     InvalidateRect(g_swHwnd, NULL, TRUE);
 }
 
-void AltTabCancel(void);
-void AltTabConfirm(void) {
+/* ─── 确认选择：必要时把目标窗口移到目标屏并激活 ─────── */
+static void AltTabConfirm(void) {
     if (g_swSel < 0 || g_swSel >= g_swCount) { AltTabCancel(); return; }
     HWND target = g_swItems[g_swSel].hwnd;
     if (g_swTargetMon) {
@@ -548,7 +400,8 @@ void AltTabConfirm(void) {
     AltTabCancel();
 }
 
-void AltTabCancel(void) {
+/* ─── 取消：注销缩略图并销毁叠加窗口 ─────────────────── */
+static void AltTabCancel(void) {
     g_switcherActive = 0;
     if (g_swHwnd) {
         for (int i = 0; i < g_swCount; i++)
@@ -558,158 +411,43 @@ void AltTabCancel(void) {
     }
 }
 
-/* ─── 窗口过程 ────────────────────────────────────── */
-LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    if (msg == g_uShellHookMsg) {
-        switch (wParam) {
-        case HSHELL_WINDOWCREATED:   OnWindowCreated((HWND)lParam); break;
-        case HSHELL_WINDOWACTIVATED: OnWindowActivated((HWND)lParam); break;
-        case 2: /* HSHELL_WINDOWDESTROYED */
-            g_lastDestroyTick = GetTickCount();
-            break;
-        }
-        return 0;
-    }
+/* ═══════════════════════════════════════════════════════
+ * 三、对外接口
+ * ═══════════════════════════════════════════════════════ */
 
+/* 处理切换器自定义消息：返回非 0 表示已处理 */
+int SwitcherHandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
+    (void)lParam;
     switch (msg) {
-    case WM_CREATE:
-        g_uShellHookMsg = RegisterWindowMessageA("SHELLHOOK");
-        RegisterShellHookWindow(hWnd);
-        /* RegisterHotKey 替代键盘钩子，零系统开销，不影响输入法 */
-        RegisterHotKey(hWnd, IDH_DISPLAY, MOD_WIN|MOD_ALT, 0x50); /* P */
-        RegisterHotKey(hWnd, IDH_ORIENT, MOD_WIN|MOD_ALT, 0x4F);
-        RegisterHotKey(hWnd, IDH_SWITCHER, MOD_WIN|MOD_SHIFT, VK_TAB);
-        SetTimer(hWnd, IDT_INI_CHECK, 1000, NULL);
-        return 0;
-
-    case WM_USER + 200:  /* Show switcher */
+    case WM_SW_SHOW:    /* 请求显示 */
         if (!g_switcherActive) {
             g_switcherActive = 1;
-            PostMessageA(hWnd, WM_USER + 210, 0, 0);
+            PostMessageA(g_hMainWnd, WM_SW_DOSHOW, 0, 0);
         }
-        return 0;
-    case WM_USER + 201:  /* Cycle selection */
+        return 1;
+    case WM_SW_CYCLE:   /* 循环选择 */
         if (g_switcherActive)
             AltTabCycle((int)wParam);
-        return 0;
-    case WM_USER + 202:  /* Confirm selection */
+        return 1;
+    case WM_SW_CONFIRM: /* 确认选择 */
         if (g_switcherActive)
             AltTabConfirm();
-        return 0;
-    case WM_USER + 203:  /* Cancel */
+        return 1;
+    case WM_SW_CANCEL:  /* 取消 */
         if (g_switcherActive)
             AltTabCancel();
-        return 0;
-    case WM_USER + 210:  /* Actually show the switcher UI */
+        return 1;
+    case WM_SW_DOSHOW:  /* 实际显示叠加窗口 */
         AltTabShow();
-        return 0;
-
-    case WM_HOTKEY: {
-        int id = (int)wParam;
-        if (id==IDH_DISPLAY) {int c=GetMonitorCount();
-            if(c>=2)ShellExecuteA(0,"open","DisplaySwitch.exe","/internal",0,SW_HIDE);
-            else{ShellExecuteA(0,"open","DisplaySwitch.exe","/extend",0,SW_HIDE);
-            if(g_cfg.SavedBrightness>=0)SetSecondaryBrightness(g_cfg.SavedBrightness);
-            SetOrientationAndSide(g_cfg.SecondaryOrientation,g_cfg.SecondarySide);}
-            UpdateActiveState();return 0;
-        }
-        if(id==IDH_ORIENT&&GetMonitorCount()>=2){
-            int n=(g_cfg.SecondaryOrientation+1)%4;
-            if(SetOrientationAndSide(n,g_cfg.SecondarySide)){g_cfg.SecondaryOrientation=n;SaveConfig();}
-            return 0;
-        }
-        if(id==IDH_SWITCHER&&!g_switcherActive){
-            g_switcherActive=1;GetCursorPos(&g_swHookCursor);AltTabShow();return 0;
-        }
-        return 0;
+        return 1;
     }
-    case WM_TIMER:
-        if (wParam == IDT_INI_CHECK) { CheckIniChanged(); return 0; }
-        return 0;
-
-    case WM_DESTROY:
-        DestroyTrayIcon(hWnd);
-        PostQuitMessage(0);
-        return 0;
-
-    case WM_TRAY_ICON:
-        if (lParam == WM_RBUTTONUP || lParam == WM_LBUTTONUP) {
-            POINT pt;
-            GetCursorPos(&pt);
-            HMENU hMenu = CreatePopupMenu();
-            AppendMenuA(hMenu, MF_STRING, ID_TRAY_OPEN, "\xc9\xe8\xd6\xc3");
-            AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
-            AppendMenuA(hMenu, MF_STRING, ID_TRAY_EXIT, "\xcd\xcb\xb3\xf6");
-            SetForegroundWindow(hWnd);
-            int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_NONOTIFY,
-                                     pt.x, pt.y, 0, hWnd, NULL);
-            DestroyMenu(hMenu);
-            if (cmd == ID_TRAY_OPEN) OpenSettingsGui();
-            else if (cmd == ID_TRAY_EXIT) PostQuitMessage(0);
-        }
-        return 0;
-    }
-    return DefWindowProcA(hWnd, msg, wParam, lParam);
+    return 0;
 }
 
-/* ─── WinMain ──────────────────────────────────────── */
-int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nCmdShow) {
-    (void)hPrev;
-
-    g_hInst = hInst;
-    GetExeDir();
-    GetIniPath();
-
-    /* --settings 参数 → 直接运行设置界面 */
-    if (lpCmd && lpCmd[0] && strstr(lpCmd, "--settings")) {
-        SetProcessDPIAware();
-        INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_STANDARD_CLASSES | ICC_BAR_CLASSES};
-        InitCommonControlsEx(&icc);
-        return RunSettingsGui(hInst, nCmdShow);
-    }
-
-    SetProcessDPIAware();
-
-    HANDLE hMutex = CreateMutexA(NULL, FALSE, "WindowMoveMutex");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        HWND hW = FindWindowA("WindowMoveClass", NULL);
-        if (hW) { ShowWindow(hW, SW_SHOW); SetForegroundWindow(hW); }
-        CloseHandle(hMutex);
-        return 0;
-    }
-
-    LoadConfig();
-    UpdateActiveState();
-
-    INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_STANDARD_CLASSES | ICC_BAR_CLASSES};
-    InitCommonControlsEx(&icc);
-
-    WNDCLASSA wc = {0};
-    wc.lpfnWndProc   = WndProc;
-    wc.hInstance     = hInst;
-    wc.hIcon         = LoadIconA(hInst, MAKEINTRESOURCEA(1));
-    wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
-    wc.lpszClassName = "WindowMoveClass";
-    RegisterClassA(&wc);
-
-    g_hMainWnd = CreateWindowA("WindowMoveClass", "Secondary Display Assistant",
-                               0, 0, 0, 0, 0, NULL, NULL, hInst, NULL);
-    if (!g_hMainWnd) { CloseHandle(hMutex); return 1; }
-
-    CreateTrayIcon(g_hMainWnd);
-
-    if (GetMonitorCount() >= 2) {
-        if (g_cfg.SavedBrightness >= 0)
-            SetSecondaryBrightness(g_cfg.SavedBrightness);
-        SetOrientationAndSide(g_cfg.SecondaryOrientation, g_cfg.SecondarySide);
-    }
-
-    MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
-    }
-
-    CloseHandle(hMutex);
-    return 0;
+/* 热键唤起：记录光标位置并显示切换器（已激活时忽略） */
+void SwitcherStartFromHotkey(void) {
+    if (g_switcherActive) return;
+    g_switcherActive = 1;
+    GetCursorPos(&g_swHookCursor);
+    AltTabShow();
 }

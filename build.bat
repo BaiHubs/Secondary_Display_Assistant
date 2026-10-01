@@ -21,16 +21,18 @@ set NAME=Secondary Display Assistant
 set CFLAGS=-O2 -s -mwindows -fexec-charset=GBK
 set LIBS=-lcomctl32 -ldwmapi -lgdi32 -luser32
 
+set SRC=src\main.c src\wndproc.c src\hotkeys.c src\shellhook.c src\window_filter.c src\switcher.c src\tray.c src\config.c src\monitor.c src\move.c src\brightness.c src\display_cmd.c src\settings.c
+
 echo [1/3] winmover_res.o ...
-windres winmover.rc -o winmover_res.o >nul 2>&1
+windres res\winmover.rc -o winmover_res.o >nul 2>&1
 
 echo [2/3] "%NAME%.exe" ...
-%CC% winmover.c config.c monitor.c move.c brightness.c display_cmd.c gui.c settings.c winmover_res.o -o "%NAME%.exe" %CFLAGS% %LIBS%
+%CC% %SRC% winmover_res.o -o "%NAME%.exe" %CFLAGS% %LIBS%
 if exist "%NAME%.exe" (
     echo   OK
 ) else (
     echo   Retrying without resource object ...
-    %CC% winmover.c config.c monitor.c move.c brightness.c display_cmd.c gui.c settings.c -o "%NAME%.exe" %CFLAGS% %LIBS%
+    %CC% %SRC% -o "%NAME%.exe" %CFLAGS% %LIBS%
     if exist "%NAME%.exe" (echo   OK - no icon) else (echo   FAILED)
 )
 

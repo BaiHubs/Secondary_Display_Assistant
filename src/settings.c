@@ -1,4 +1,8 @@
-/* settings.c — 设置界面（内嵌于单 exe 中，通过 --settings 参数启动） */
+/* settings.c — 设置界面（内嵌于单 exe 中，通过 --settings 参数启动）
+ *
+ * 深色主题设置窗口：功能开关、DPI 缩放、亮度、副屏方向/位置、快捷键说明。
+ * 通过 RunSettingsGui() 进入；控件变更即时应用并写回 INI。
+ */
 #include "winmover.h"
 
 /* ─── 控件 ID ─────────────────────────────────────── */

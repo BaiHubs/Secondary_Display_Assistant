@@ -1,4 +1,9 @@
-/* winmover.h — 窗口移动助手 C 版 */
+/* winmover.h — 公共头文件（窗口移动助手 Secondary Display Assistant）
+ *
+ * 集中声明：配置结构体 Config、跨模块全局变量（extern）、
+ * 窗口/定时器等常量，以及各模块的公开函数原型。
+ * 实现分散于 src/ 下各 .c 文件（见每个函数上方模块注释）。
+ */
 #ifndef WINMOVER_H
 #define WINMOVER_H
 
@@ -48,6 +53,7 @@ extern int      g_secondaryScale;
 extern HWND     g_guiHwnd;
 extern int      g_guiOpenFlag;
 extern HINSTANCE g_hInst;
+extern HWND     g_hMainWnd;
 
 /* ─── 常量 ────────────────────────────────────────── */
 #define WM_TRAY_ICON      (WM_USER + 100)
@@ -61,8 +67,16 @@ extern HINSTANCE g_hInst;
 #define SIDE_LEFT   0
 #define SIDE_RIGHT  1
 
-/* ─── 函数声明 ────────────────────────────────────── */
-/* config.c */
+/* ─── 函数声明（按模块分节） ──────────────────────── */
+
+/* main.c — 主入口与全局状态 */
+void  UpdateActiveState(void);
+void  OpenSettingsGui(void);
+
+/* wndproc.c — 主窗口消息过程 */
+LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+/* config.c — INI 配置读写 */
 void  GetIniPath(void);
 void  LoadConfig(void);
 void  SaveConfig(void);
@@ -70,9 +84,8 @@ int   IniReadInt(const char *sec, const char *key, int def);
 void  IniWriteInt(const char *sec, const char *key, int val);
 void  ApplyConfigFromIni(void);
 void  CheckIniChanged(void);
-void UpdateActiveState(void);
 
-/* monitor.c */
+/* monitor.c — 显示器查询 */
 int   GetMonitorCount(void);
 int   IsPrimaryMonitor(HMONITOR hMon);
 HMONITOR GetPrimaryMonitorHandle(void);
@@ -82,28 +95,41 @@ int   GetMonitorRect(HMONITOR hMon, RECT *rc);
 int   GetMonitorWorkRect(HMONITOR hMon, RECT *rc);
 int   GetMonitorScale(HMONITOR hMon);
 
-/* move.c */
+/* move.c — 窗口移动 */
 void  MoveWindowToMonitor(HWND hWnd, HMONITOR hTarget, int fullScreen);
-int   IsExcludedWindow(HWND hWnd);
 void  DelayedMove(HWND hWnd, HMONITOR hMonMouse);
 
-/* brightness.c */
+/* window_filter.c — 窗口筛选 / 分类 */
+int   IsExcludedWindow(HWND hWnd);
+int   IsRealAppWindow(HWND hWnd);
+
+/* shellhook.c — Shell 钩子 */
+void  ShellHookInit(HWND hWnd);
+int   ShellHookHandleMessage(UINT msg, WPARAM wParam, LPARAM lParam);
+
+/* hotkeys.c — 全局热键 */
+void  RegisterAppHotKeys(HWND hWnd);
+void  HandleHotKey(int id);
+
+/* switcher.c — 窗口切换器 */
+void  ShowMonitorSwitcher(void);
+int   SwitcherHandleMessage(UINT msg, WPARAM wParam, LPARAM lParam);
+void  SwitcherStartFromHotkey(void);
+
+/* tray.c — 托盘图标与菜单 */
+void  CreateTrayIcon(HWND hWnd);
+void  DestroyTrayIcon(HWND hWnd);
+void  TrayHandleMessage(HWND hWnd, WPARAM wParam, LPARAM lParam);
+
+/* brightness.c — DDC/CI 亮度 */
 int   GetSecondaryBrightness(void);
 void  SetSecondaryBrightness(int val);
 
-/* display_cmd.c */
+/* display_cmd.c — 副屏方向与位置 */
 int   GetCurrentOrientation(void);
 int   SetOrientationAndSide(int orientation, int side);
 
-/* gui.c */
-void  CreateTrayIcon(HWND hWnd);
-void  DestroyTrayIcon(HWND hWnd);
-
-/* winmover.c */
-void  ShowMonitorSwitcher(void);
-
-/* settings.c */
+/* settings.c — 设置界面 */
 int   RunSettingsGui(HINSTANCE hInst, int nCmdShow);
-void  OpenSettingsGui(void);
 
 #endif /* WINMOVER_H */

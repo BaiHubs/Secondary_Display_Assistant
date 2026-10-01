@@ -1,45 +1,12 @@
-/* move.c — 窗口移动 + 排除 */
+/* move.c — 窗口移动
+ *
+ * 负责把窗口移动到目标显示器并按 DPI 缩放尺寸：
+ *   - MoveWindowToMonitor()    移动到指定显示器（支持全屏模式）
+ *   - DelayedMove()            窗口创建后的延迟移动
+ *   - ResizeWindowForMonitor() 依据两屏缩放比例调整窗口大小（内部）
+ * 窗口筛选（IsExcludedWindow / IsRealAppWindow）见 window_filter.c。
+ */
 #include "winmover.h"
-
-/* ─── 排除临时窗口 ────────────────────────────────── */
-int IsExcludedWindow(HWND hWnd) {
-    if (!IsWindow(hWnd)) return 1;
-    if (hWnd == g_guiHwnd) return 1;
-
-    LONG style = GetWindowLongA(hWnd, GWL_STYLE);
-    LONG exStyle = GetWindowLongA(hWnd, GWL_EXSTYLE);
-
-    /* WS_EX_TOOLWINDOW */
-    if (exStyle & 0x80) return 1;
-    /* WS_EX_NOACTIVATE + 无标题栏 */
-    if ((exStyle & 0x80000) && !(style & 0xC00000)) return 1;
-    /* WS_EX_TRANSPARENT */
-    if (exStyle & 0x20) return 1;
-    /* 无标题栏且太小 */
-    if (!(style & 0xC00000)) {
-        RECT rc;
-        if (GetWindowRect(hWnd, &rc)) {
-            if ((rc.right - rc.left) < 100 && (rc.bottom - rc.top) < 100)
-                return 1;
-        }
-    }
-
-    /* 已知类名排除 */
-    char cls[64];
-    if (GetClassNameA(hWnd, cls, sizeof(cls))) {
-        static const char *known[] = {
-            "Crosshair", "SnipWindow", "GDI+ Hook Window Class",
-            "CiceroUIWndFrame", "Qt5QWindowIcon",
-            "Windows.UI.Core.CoreWindow", "ApplicationFrameWindow",
-            "Intermediate D3D Window", "OverlayWindow",
-            "PopupHost", "ScreenClippingHost", NULL
-        };
-        for (int i = 0; known[i]; i++) {
-            if (strcmp(cls, known[i]) == 0) return 1;
-        }
-    }
-    return 0;
-}
 
 /* ─── 根据 DPI 缩放窗口大小 ────────────────────────── */
 static void ResizeWindowForMonitor(HWND hWnd, HMONITOR currMon, HMONITOR tgtMon,
