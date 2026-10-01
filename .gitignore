@@ -94,3 +94,6 @@ out/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #cmake-build-*
 CMakePresets.json
+
+# 构建时拷到 exe 同目录的运行时 UI（源在 src/settings.uix）
+/settings.uix

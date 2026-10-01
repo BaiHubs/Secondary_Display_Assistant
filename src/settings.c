@@ -1,446 +1,283 @@
-/* settings.c — 设置界面（内嵌于单 exe 中，通过 --settings 参数启动）
+/* settings.c — 设置界面（Core UI .uix 页面 + 原生桥接）
  *
- * 深色主题设置窗口：功能开关、DPI 缩放、亮度、副屏方向/位置、快捷键说明。
- * 通过 RunSettingsGui() 进入；控件变更即时应用并写回 INI。
+ * 界面本体由 Core UI 框架渲染：布局与样式在 settings.uix 单文件组件里，
+ * 本文件只做"宿主 + 桥接"三件事：
+ *   1. 初始化 Core UI、加载 .uix、打开窗口；
+ *   2. 打开后用 ui_widget_find_by_id 解析各控件句柄并挂原生回调；
+ *   3. 回调里读写 g_cfg、调用原生操作（副屏方向 / 亮度），并写回 INI。
+ *
+ * 约定：交互控件的真实值由 C 端直接读写（不依赖 JS 双向绑定），
+ * JS 侧 <script> 只负责状态行文字与"启用窗口移动"的 :enabled 联动；
+ * C 端只向页面推 int / bool，中文字符串一律写在 .uix 内（UTF-8）。
+ *
+ * 入口 RunSettingsGui() 保留原签名，兼容 main.c 的托盘菜单与 --settings 路径。
  */
 #include "winmover.h"
+#include "ui_core.h"
 
-/* ─── 控件 ID ─────────────────────────────────────── */
-#define IDC_STARTUP          1001
-#define IDC_MANUAL_OVERRIDE  1002
-#define IDC_MANUAL_ACTIVE    1003
-#define IDC_TASKBAR_MOVE     1004
-#define IDC_FULLSCREEN       1005
-#define IDC_PRIMARY_SCALE    1006
-#define IDC_SECONDARY_SCALE  1007
-#define IDC_BRIGHTNESS_SLIDER 1008
-#define IDC_BRIGHTNESS_TEXT  1009
-#define IDC_ORIENTATION      1010
-#define IDC_SIDE_LEFT        1011
-#define IDC_SIDE_RIGHT       1012
-#define IDC_SAVE_BTN         1013
-#define IDC_RESTORE_BTN      1014
-#define IDC_STATUS_TEXT      1015
-#define IDC_SWITCHER         1016
+/* ─── 页面与控件句柄 ───────────────────────────────── */
+static UiPage   g_page = 0;
+static UiWindow g_win  = 0;
 
-/* ─── 控件全局句柄 ─────────────────────────────────── */
-static HWND g_hStatus, g_hStartup, g_hManualOvr, g_hManualAct,
-            g_hTaskbar, g_hFullscreen, g_hSwitcher,
-            g_hPriScale, g_hSecScale,
-            g_hBrightSlider, g_hBrightText,
-            g_hOrientation, g_hSideL, g_hSideR,
-            g_hSave, g_hRestore;
-static HFONT  g_hFont, g_hFontSmall, g_hFontBold;
-static HBRUSH g_hBgBrush, g_hEditBgBrush;
-static Config g_oldCfg;  /* 用于检测变更 */
+static UiWidget g_wStartup, g_wManualOvr, g_wManualAct, g_wTaskbar,
+                g_wFullscreen, g_wSwitcher,
+                g_wPriScale, g_wSecScale,
+                g_wBright, g_wOrientation,
+                g_wSideL, g_wSideR,
+                g_wSave, g_wRestore;
 
-/* ─── 深色主题 ─────────────────────────────────────── */
-static void InitTheme(HWND hWnd) {
-    g_hBgBrush    = CreateSolidBrush(RGB(0x20, 0x20, 0x20));
-    g_hEditBgBrush = CreateSolidBrush(RGB(0x2B, 0x2B, 0x2B));
-    BOOL dark = TRUE;
-    DwmSetWindowAttribute(hWnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
-}
-
-/* ─── 更新控件值 ───────────────────────────────────── */
-static void UpdateControls(void) {
-    char buf[64];
+/* ─── 状态行 / 亮度：把展示态写入页面（只推 int / bool） ─── */
+static void PushDisplayState(void) {
     int monCnt = GetMonitorCount();
-    int active = g_cfg.ManualOverride ? g_cfg.ManualActive : (monCnt >= 2);
-
-    _snprintf(buf, sizeof(buf), "\xd7\xb4\xcc\xac: %s (%d \xb8\xf6\xcf\xd4\xca\xbe\xc6\xf7)",
-              active ? "\xbf\xaa" : "\xb9\xd8", monCnt);
-    SetWindowTextA(g_hStatus, buf);
-
-    SendMessage(g_hManualOvr, BM_SETCHECK, g_cfg.ManualOverride ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessage(g_hManualAct, BM_SETCHECK, g_cfg.ManualActive ? BST_CHECKED : BST_UNCHECKED, 0);
-    EnableWindow(g_hManualAct, g_cfg.ManualOverride ? TRUE : FALSE);
-    SendMessage(g_hTaskbar,    BM_SETCHECK, g_cfg.TaskbarMoveEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessage(g_hFullscreen, BM_SETCHECK, g_cfg.FullScreenMode ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessage(g_hStartup,    BM_SETCHECK, g_cfg.StartupEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessage(g_hSwitcher,   BM_SETCHECK, g_cfg.SwitcherEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
-
-    _snprintf(buf, sizeof(buf), "%d", g_cfg.PrimaryScale);
-    SetWindowTextA(g_hPriScale, buf);
-    _snprintf(buf, sizeof(buf), "%d", g_cfg.SecondaryScale);
-    SetWindowTextA(g_hSecScale, buf);
-
-    SendMessage(g_hOrientation, CB_SETCURSEL, (WPARAM)g_cfg.SecondaryOrientation, 0);
-    SendMessage(g_hSideL, BM_SETCHECK, g_cfg.SecondarySide == 0 ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessage(g_hSideR, BM_SETCHECK, g_cfg.SecondarySide == 1 ? BST_CHECKED : BST_UNCHECKED, 0);
-
     int bright = g_cfg.SavedBrightness;
     if (bright < 0) {
         int actual = GetSecondaryBrightness();
         if (actual >= 0) { bright = actual; g_cfg.SavedBrightness = actual; SaveConfig(); }
     }
-    SendMessage(g_hBrightSlider, TBM_SETPOS, TRUE, bright >= 0 ? bright : 0);
-    EnableWindow(g_hBrightSlider, bright >= 0 ? TRUE : FALSE);
-    _snprintf(buf, sizeof(buf), bright >= 0 ? "%d%%" : "\xb2\xbb\xd6\xa7\xb3\xd6", bright >= 0 ? bright : 0);
-    SetWindowTextA(g_hBrightText, buf);
+    ui_page_set_int (g_page, "monCount",            monCnt);
+    ui_page_set_bool(g_page, "manualOverride",      g_cfg.ManualOverride ? 1 : 0);
+    ui_page_set_bool(g_page, "manualActive",        g_cfg.ManualActive ? 1 : 0);
+    ui_page_set_int (g_page, "side",                g_cfg.SecondarySide);
+    ui_page_set_bool(g_page, "brightnessSupported", bright >= 0 ? 1 : 0);
+    ui_page_set_int (g_page, "brightness",          bright >= 0 ? bright : 0);
 }
 
-/* ─── 从界面保存配置 ───────────────────────────────── */
-static void SaveFromUI(void) {
-    char buf[32];
+/* ─── 数值输入框 int <-> 宽字符 ─────────────────────── */
+static void SetScaleText(UiWidget w, int v) {
+    wchar_t buf[16];
+    if (!w) return;
+    _snwprintf(buf, 16, L"%d", v);
+    ui_text_input_set_text(w, buf);
+}
 
-    g_cfg.ManualOverride     = (SendMessage(g_hManualOvr, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
-    g_cfg.ManualActive       = (SendMessage(g_hManualAct, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
-    g_cfg.TaskbarMoveEnabled = (SendMessage(g_hTaskbar, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
-    g_cfg.FullScreenMode     = (SendMessage(g_hFullscreen, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
-    g_cfg.StartupEnabled     = (SendMessage(g_hStartup, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
-    g_cfg.SwitcherEnabled    = (SendMessage(g_hSwitcher, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
+static int ReadScaleText(UiWidget w, int def) {
+    const wchar_t* t = w ? ui_text_input_get_text(w) : NULL;
+    int v;
+    if (!t || !t[0]) return def;
+    v = _wtoi(t);
+    if (v < 50 || v > 500) return def;
+    return v;
+}
 
-    GetWindowTextA(g_hPriScale, buf, sizeof(buf));
-    int v = atoi(buf);
-    if (v < 50 || v > 500) v = 150;
-    g_cfg.PrimaryScale = v;
-    _snprintf(buf, sizeof(buf), "%d", v);
-    SetWindowTextA(g_hPriScale, buf);
+/* ─── 按 g_cfg 刷新控件（初始化 / 恢复默认后调用） ──── */
+static void SeedWidgets(void) {
+    int bright = g_cfg.SavedBrightness;
 
-    GetWindowTextA(g_hSecScale, buf, sizeof(buf));
-    v = atoi(buf);
-    if (v < 50 || v > 500) v = 125;
-    g_cfg.SecondaryScale = v;
-    _snprintf(buf, sizeof(buf), "%d", v);
-    SetWindowTextA(g_hSecScale, buf);
+    ui_toggle_set_on(g_wStartup,    g_cfg.StartupEnabled ? 1 : 0);
+    ui_toggle_set_on(g_wManualOvr,  g_cfg.ManualOverride ? 1 : 0);
+    ui_toggle_set_on(g_wManualAct,  g_cfg.ManualActive ? 1 : 0);
+    ui_toggle_set_on(g_wTaskbar,    g_cfg.TaskbarMoveEnabled ? 1 : 0);
+    ui_toggle_set_on(g_wFullscreen, g_cfg.FullScreenMode ? 1 : 0);
+    ui_toggle_set_on(g_wSwitcher,   g_cfg.SwitcherEnabled ? 1 : 0);
+    ui_widget_set_enabled(g_wManualAct, g_cfg.ManualOverride ? 1 : 0);
 
-    int sel = (int)SendMessage(g_hOrientation, CB_GETCURSEL, 0, 0);
-    if (sel >= 0 && sel <= 3) g_cfg.SecondaryOrientation = sel;
+    SetScaleText(g_wPriScale, g_cfg.PrimaryScale);
+    SetScaleText(g_wSecScale, g_cfg.SecondaryScale);
 
-    g_cfg.SecondarySide = (SendMessage(g_hSideL, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 0 : 1;
+    ui_slider_set_value(g_wBright, (float)(bright >= 0 ? bright : 0));
+    ui_widget_set_enabled(g_wBright, bright >= 0 ? 1 : 0);
 
-    if (IsWindowEnabled(g_hBrightSlider)) {
-        g_cfg.SavedBrightness = (int)SendMessage(g_hBrightSlider, TBM_GETPOS, 0, 0);
-        SetSecondaryBrightness(g_cfg.SavedBrightness);
-    }
+    ui_combobox_set_selected(g_wOrientation, g_cfg.SecondaryOrientation);
+
+    PushDisplayState();
+}
+
+/* ─── 原生回调 ─────────────────────────────────────── */
+/* 手动覆盖开关：实时联动"启用窗口移动"的可用性 */
+static void OnManualOverride(UiWidget w, int value, void* ud) {
+    int on = value ? 1 : 0;
+    (void)w; (void)ud;
+    if (on == g_cfg.ManualOverride) return;   /* 去抖：防绑定回环 */
+    g_cfg.ManualOverride = on;
+    ui_widget_set_enabled(g_wManualAct, on ? 1 : 0);
+    ui_page_set_bool(g_page, "manualOverride", on);
+    ui_page_set_bool(g_page, "saved", 0);
+}
+
+/* 方向下拉：立即应用 + 写回 */
+static void OnOrientation(UiWidget w, int index, void* ud) {
+    (void)w; (void)ud;
+    if (index < 0 || index > 3 || index == g_cfg.SecondaryOrientation) return;
+    g_cfg.SecondaryOrientation = index;
+    if (GetMonitorCount() >= 2)
+        SetOrientationAndSide(g_cfg.SecondaryOrientation, g_cfg.SecondarySide);
+    SaveConfig();
+    ui_page_set_bool(g_page, "saved", 0);
+}
+
+/* 左右位置分段按钮：立即应用 + 写回 */
+static void OnSideClick(UiWidget w, void* ud) {
+    int side = (int)(INT_PTR)ud;
+    (void)w;
+    g_cfg.SecondarySide = side;
+    if (GetMonitorCount() >= 2)
+        SetOrientationAndSide(g_cfg.SecondaryOrientation, side);
+    SaveConfig();
+    ui_page_set_int(g_page, "side", side);
+    ui_page_set_bool(g_page, "saved", 0);
+}
+
+/* 亮度滑块：即时应用到副屏 */
+static void OnBrightness(UiWidget w, float value, void* ud) {
+    int v = (int)(value + 0.5f);
+    (void)w; (void)ud;
+    if (v < 0)   v = 0;
+    if (v > 100) v = 100;
+    if (v == g_cfg.SavedBrightness) return;
+    g_cfg.SavedBrightness = v;
+    SetSecondaryBrightness(v);
+    SaveConfig();
+    ui_page_set_int(g_page, "brightness", v);
+    ui_page_set_bool(g_page, "saved", 0);
+}
+
+/* 保存：读回所有控件 → g_cfg → INI */
+static void OnSave(UiWidget w, void* ud) {
+    (void)w; (void)ud;
+    g_cfg.StartupEnabled     = ui_toggle_get_on(g_wStartup) ? 1 : 0;
+    g_cfg.ManualOverride     = ui_toggle_get_on(g_wManualOvr) ? 1 : 0;
+    g_cfg.ManualActive       = ui_toggle_get_on(g_wManualAct) ? 1 : 0;
+    g_cfg.TaskbarMoveEnabled = ui_toggle_get_on(g_wTaskbar) ? 1 : 0;
+    g_cfg.FullScreenMode     = ui_toggle_get_on(g_wFullscreen) ? 1 : 0;
+    g_cfg.SwitcherEnabled    = ui_toggle_get_on(g_wSwitcher) ? 1 : 0;
+
+    g_cfg.PrimaryScale   = ReadScaleText(g_wPriScale, 150);
+    g_cfg.SecondaryScale = ReadScaleText(g_wSecScale, 125);
+    SetScaleText(g_wPriScale, g_cfg.PrimaryScale);
+    SetScaleText(g_wSecScale, g_cfg.SecondaryScale);
 
     SaveConfig();
-    g_oldCfg = g_cfg;
-    UpdateControls();
+    PushDisplayState();
+    ui_page_set_bool(g_page, "saved", 1);
 }
 
-/* ─── 窗口过程 ─────────────────────────────────────── */
-static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
-    case WM_CTLCOLORSTATIC:
-    case WM_CTLCOLORBTN: {
-        HDC hdc = (HDC)wParam;
-        SetBkColor(hdc, RGB(0x20, 0x20, 0x20));
-        SetTextColor(hdc, RGB(0xE0, 0xE0, 0xE0));
-        return (LRESULT)g_hBgBrush;
-    }
-    case WM_CTLCOLOREDIT: {
-        HDC hdc = (HDC)wParam;
-        SetBkColor(hdc, RGB(0x2B, 0x2B, 0x2B));
-        SetTextColor(hdc, RGB(0xFF, 0xFF, 0xFF));
-        return (LRESULT)g_hEditBgBrush;
-    }
-        SetBkColor((HDC)wParam, RGB(0x20, 0x20, 0x20));
-        SetTextColor((HDC)wParam, RGB(0xE0, 0xE0, 0xE0));
-        return (LRESULT)g_hBgBrush;
-    case WM_COMMAND: {
-        int id = LOWORD(wParam), code = HIWORD(wParam);
-        if (id == IDC_MANUAL_OVERRIDE && code == BN_CLICKED) {
-            int chk = (SendMessage(g_hManualOvr, BM_GETCHECK, 0, 0) == BST_CHECKED);
-            EnableWindow(g_hManualAct, chk ? TRUE : FALSE);
-        }
-        else if ((id == IDC_SIDE_LEFT || id == IDC_SIDE_RIGHT) && code == BN_CLICKED) {
-            g_cfg.SecondarySide = (id == IDC_SIDE_LEFT) ? 0 : 1;
-            if (GetMonitorCount() >= 2)
-                SetOrientationAndSide(g_cfg.SecondaryOrientation, g_cfg.SecondarySide);
-            SaveConfig();
-            UpdateControls();
-        }
-        else if (id == IDC_ORIENTATION && code == CBN_SELCHANGE) {
-            int sel = (int)SendMessage(g_hOrientation, CB_GETCURSEL, 0, 0);
-            if (sel >= 0 && sel <= 3) {
-                g_cfg.SecondaryOrientation = sel;
-                if (GetMonitorCount() >= 2)
-                    SetOrientationAndSide(sel, g_cfg.SecondarySide);
-                SaveConfig();
-                UpdateControls();
-            }
-        }
-        else if (id == IDC_SAVE_BTN && code == BN_CLICKED) {
-            SaveFromUI();
-            SetWindowTextA(g_hStatus, "\xd2\xd1\xb1\xa3\xb4\xe6");
-            SetTimer(hWnd, 2, 2000, NULL);
-        }
-        else if (id == IDC_RESTORE_BTN && code == BN_CLICKED) {
-            g_cfg.PrimaryScale         = 150;
-            g_cfg.SecondaryScale       = 125;
-            g_cfg.SecondaryOrientation = 0;
-            g_cfg.SecondarySide        = 0;
-            g_cfg.FullScreenMode       = 0;
-            g_cfg.TaskbarMoveEnabled   = 1;
-            g_cfg.ManualOverride       = 0;
-            g_cfg.ManualActive         = 1;
-            g_cfg.StartupEnabled       = 1;
-            g_cfg.SwitcherEnabled      = 1;
-            /* 亮度不恢复 */
-            SaveConfig();
-            UpdateControls();
-            if (GetMonitorCount() >= 2)
-                SetOrientationAndSide(g_cfg.SecondaryOrientation, g_cfg.SecondarySide);
-            SetWindowTextA(g_hStatus, "\xd2\xd1\xbb\xd6\xb8\xb4\xc4\xac\xc8\xcf");
-            SetTimer(hWnd, 2, 2000, NULL);
-        }
-        break;
-    }
-    case WM_HSCROLL:
-        if ((HWND)lParam == g_hBrightSlider) {
-            int v = (int)SendMessage(g_hBrightSlider, TBM_GETPOS, 0, 0);
-            char buf[16]; _snprintf(buf, sizeof(buf), "%d%%", v);
-            SetWindowTextA(g_hBrightText, buf);
-            if (LOWORD(wParam) == TB_THUMBPOSITION || LOWORD(wParam) == TB_ENDTRACK) {
-                g_cfg.SavedBrightness = v;
-                SetSecondaryBrightness(v);
-                SaveConfig();
-            }
-        }
-        break;
-    case WM_TIMER:
-        if (wParam == 2) { KillTimer(hWnd, 2); UpdateControls(); }
-        return 0;
-    case WM_CLOSE:
-        g_guiHwnd = NULL;
-        g_guiOpenFlag = 0;
-        DestroyWindow(hWnd);
-        return 0;
-    case WM_DESTROY:
-        PostQuitMessage(0);
-        return 0;
-    }
-    return DefWindowProcA(hWnd, msg, wParam, lParam);
+/* 恢复默认：重置 g_cfg 并刷新控件（亮度不恢复，同原逻辑） */
+static void OnRestore(UiWidget w, void* ud) {
+    (void)w; (void)ud;
+    g_cfg.PrimaryScale         = 150;
+    g_cfg.SecondaryScale       = 125;
+    g_cfg.SecondaryOrientation = 0;
+    g_cfg.SecondarySide        = 0;
+    g_cfg.FullScreenMode       = 0;
+    g_cfg.TaskbarMoveEnabled   = 1;
+    g_cfg.ManualOverride       = 0;
+    g_cfg.ManualActive         = 1;
+    g_cfg.StartupEnabled       = 1;
+    g_cfg.SwitcherEnabled      = 1;
+    SaveConfig();
+    if (GetMonitorCount() >= 2)
+        SetOrientationAndSide(g_cfg.SecondaryOrientation, g_cfg.SecondarySide);
+    SeedWidgets();
+    ui_page_set_bool(g_page, "saved", 0);
 }
 
-/* ─── 创建控件 ─────────────────────────────────────── */
-static HWND CreateDarkBtn(HWND parent, int x, int y, int w, int h, const char *t, int id) {
-    HWND btn = CreateWindowA("BUTTON", t, WS_VISIBLE|WS_CHILD|BS_PUSHBUTTON|BS_CENTER,
-                             x, y, w, h, parent, (HMENU)(INT_PTR)id, GetModuleHandleA(NULL), NULL);
-    SendMessage(btn, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-    return btn;
+/* 窗口关闭：复位全局标记 */
+static void OnWindowClose(UiWindow win, void* ud) {
+    (void)win; (void)ud;
+    g_guiHwnd     = NULL;
+    g_guiOpenFlag = 0;
 }
 
-static void CreateControls(HWND hWnd) {
-    int xm = 20, ww = 680, row = 0;
-    const char *oriItems[] = {
-        "\xba\xe1\xcf\xf2(0)", "\xd7\xdd\xcf\xf2(90)",
-        "\xba\xe1\xb7\xad(180)", "\xd7\xdd\xb7\xad(270)"
-    };
+/* ─── 解析 / 连接控件 ──────────────────────────────── */
+static void ResolveWidgets(void) {
+    UiWidget root = ui_page_root(g_page);
+    g_wStartup     = ui_widget_find_by_id(root, "startup");
+    g_wManualOvr   = ui_widget_find_by_id(root, "manualOverride");
+    g_wManualAct   = ui_widget_find_by_id(root, "manualActive");
+    g_wTaskbar     = ui_widget_find_by_id(root, "taskbar");
+    g_wFullscreen  = ui_widget_find_by_id(root, "fullscreen");
+    g_wSwitcher    = ui_widget_find_by_id(root, "switcher");
+    g_wPriScale    = ui_widget_find_by_id(root, "primaryScale");
+    g_wSecScale    = ui_widget_find_by_id(root, "secondaryScale");
+    g_wBright      = ui_widget_find_by_id(root, "brightness");
+    g_wOrientation = ui_widget_find_by_id(root, "orientation");
+    g_wSideL       = ui_widget_find_by_id(root, "sideLeft");
+    g_wSideR       = ui_widget_find_by_id(root, "sideRight");
+    g_wSave        = ui_widget_find_by_id(root, "save");
+    g_wRestore     = ui_widget_find_by_id(root, "restore");
+}
 
-    g_hStatus = CreateWindowA("STATIC", "\xb5\xc8\xb4\xfd...",
-                              WS_VISIBLE|WS_CHILD, xm, 15, ww, 22, hWnd,
-                              (HMENU)(INT_PTR)IDC_STATUS_TEXT, NULL, NULL);
-    SendMessage(g_hStatus, WM_SETFONT, (WPARAM)g_hFontBold, TRUE);
+static void WireWidgets(void) {
+    ui_toggle_on_changed(g_wManualOvr, OnManualOverride, NULL);
 
-    row = 42;
-    CreateWindowA("BUTTON", "\xb9\xa6\xc4\xdc\xbf\xd8\xd6\xc6",
-                  WS_VISIBLE|WS_CHILD|BS_GROUPBOX,
-                  xm, row, ww, 140, hWnd, NULL, NULL, NULL);
-    SendMessage(GetWindow(hWnd, GW_CHILD), WM_SETFONT, (WPARAM)g_hFont, TRUE);
+    ui_widget_on_click(g_wSideL, OnSideClick, (void*)(INT_PTR)0);
+    ui_widget_on_click(g_wSideR, OnSideClick, (void*)(INT_PTR)1);
 
-    g_hStartup = CreateWindowA("BUTTON", "\xbf\xaa\xbb\xfa\xd7\xd4\xc6\xf4\xb6\xaf",
-                   WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX,
-                   35, row+22, 130, 20, hWnd, (HMENU)(INT_PTR)IDC_STARTUP, NULL, NULL);
-    SendMessage(g_hStartup, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+    ui_slider_on_changed(g_wBright, OnBrightness, NULL);
+    ui_combobox_on_changed(g_wOrientation, OnOrientation, NULL);
 
-    g_hManualOvr = CreateWindowA("BUTTON", "\xca\xd6\xb6\xaf\xb8\xb2\xb8\xc7\xd7\xd4\xb6\xaf\xbc\xec\xb2\xe2",
-                    WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX,
-                    230, row+22, 170, 20, hWnd, (HMENU)(INT_PTR)IDC_MANUAL_OVERRIDE, NULL, NULL);
-    SendMessage(g_hManualOvr, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-
-    g_hManualAct = CreateWindowA("BUTTON", "\xc6\xf4\xd3\xc3\xb4\xb0\xbf\xda\xd2\xc6\xb6\xaf",
-                   WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX,
-                    420, row+22, 160, 20, hWnd, (HMENU)(INT_PTR)IDC_MANUAL_ACTIVE, NULL, NULL);
-    SendMessage(g_hManualAct, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-
-    g_hTaskbar = CreateWindowA("BUTTON", "\xc8\xce\xce\xf1\xc0\xb8\xbf\xe7\xc6\xc1\xd2\xc6\xb6\xaf",
-                  WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX,
-                  35, row+48, 150, 20, hWnd, (HMENU)(INT_PTR)IDC_TASKBAR_MOVE, NULL, NULL);
-    SendMessage(g_hTaskbar, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-
-    g_hFullscreen = CreateWindowA("BUTTON", "\xc8\xab\xc6\xc1\xc4\xa3\xca\xbd\xa3\xa8\xb8\xb1\xc6\xc1\xd7\xee\xb4\xf3\xbb\xaf\xa3\xa9",
-                     WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX,
-                     35, row+74, 280, 20, hWnd, (HMENU)(INT_PTR)IDC_FULLSCREEN, NULL, NULL);
-    SendMessage(g_hFullscreen, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-
-    g_hSwitcher = CreateWindowA("BUTTON", "\xb4\xb0\xbf\xda\xc7\xd0\xbb\xbb\xc6\xf7",
-                   WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX,
-                   35, row+96, 150, 20, hWnd, (HMENU)(INT_PTR)IDC_SWITCHER, NULL, NULL);
-    SendMessage(g_hSwitcher, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-
-    row += 147;
-    CreateWindowA("BUTTON", "DPI \xcb\xf5\xb7\xc5\xb1\xc8\xc0\xfd(%)",
-                  WS_VISIBLE|WS_CHILD|BS_GROUPBOX,
-                  xm, row, ww, 100, hWnd, NULL, NULL, NULL);
-    SendMessage(GetWindow(hWnd, GW_CHILD), WM_SETFONT, (WPARAM)g_hFont, TRUE);
-
-    CreateWindowA("STATIC", "\xd6\xf7\xc6\xc1:", WS_VISIBLE|WS_CHILD, 35, row+24, 55, 18,
-                  hWnd, NULL, NULL, NULL);
-    SendMessage(GetWindow(hWnd, GW_CHILD), WM_SETFONT, (WPARAM)g_hFont, TRUE);
-
-    g_hPriScale = CreateWindowA("EDIT", "150", WS_VISIBLE|WS_CHILD|WS_BORDER|ES_NUMBER,
-                                95, row+21, 60, 22, hWnd, (HMENU)(INT_PTR)IDC_PRIMARY_SCALE, NULL, NULL);
-    SendMessage(g_hPriScale, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-
-    CreateWindowA("STATIC", "\xb8\xb1\xc6\xc1:", WS_VISIBLE|WS_CHILD, 260, row+24, 55, 18,
-                  hWnd, NULL, NULL, NULL);
-    SendMessage(GetWindow(hWnd, GW_CHILD), WM_SETFONT, (WPARAM)g_hFont, TRUE);
-
-    g_hSecScale = CreateWindowA("EDIT", "125", WS_VISIBLE|WS_CHILD|WS_BORDER|ES_NUMBER,
-                                320, row+21, 60, 22, hWnd, (HMENU)(INT_PTR)IDC_SECONDARY_SCALE, NULL, NULL);
-    SendMessage(g_hSecScale, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-
-    CreateWindowA("STATIC", "\xd2\xc6\xb5\xbd\xb8\xb1\xc6\xc1\xca\xb1\xd7\xd4\xb6\xaf\xcb\xf5\xb7\xc5",
-                  WS_VISIBLE|WS_CHILD, 35, row+50, 350, 22, hWnd, NULL, NULL, NULL);
-    SendMessage(GetWindow(hWnd, GW_CHILD), WM_SETFONT, (WPARAM)g_hFontSmall, TRUE);
-
-    row += 110;
-    CreateWindowA("BUTTON", "\xc1\xc1\xb6\xc8\xb5\xf7\xbd\xda (DDC/CI)",
-                  WS_VISIBLE|WS_CHILD|BS_GROUPBOX,
-                  xm, row, ww, 72, hWnd, NULL, NULL, NULL);
-    SendMessage(GetWindow(hWnd, GW_CHILD), WM_SETFONT, (WPARAM)g_hFont, TRUE);
-
-    g_hBrightSlider = CreateWindowA(TRACKBAR_CLASSA, "",
-                        WS_VISIBLE|WS_CHILD|TBS_AUTOTICKS|TBS_ENABLESELRANGE,
-                        35, row+24, 500, 28, hWnd, (HMENU)(INT_PTR)IDC_BRIGHTNESS_SLIDER, NULL, NULL);
-    SendMessage(g_hBrightSlider, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
-    SendMessage(g_hBrightSlider, TBM_SETTICFREQ, 10, 0);
-
-    g_hBrightText = CreateWindowA("STATIC", "0%", WS_VISIBLE|WS_CHILD,
-                                  550, row+26, 50, 18, hWnd,
-                                  (HMENU)(INT_PTR)IDC_BRIGHTNESS_TEXT, NULL, NULL);
-    SendMessage(g_hBrightText, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-
-    row += 92;
-    CreateWindowA("BUTTON", "\xb8\xb1\xc6\xc1\xb7\xbd\xcf\xf2\xd3\xeb\xce\xbb\xd6\xc3",
-                  WS_VISIBLE|WS_CHILD|BS_GROUPBOX, xm, row, ww, 120, hWnd, NULL, NULL, NULL);
-    SendMessage(GetWindow(hWnd, GW_CHILD), WM_SETFONT, (WPARAM)g_hFont, TRUE);
-
-    CreateWindowA("STATIC", "\xb7\xbd\xcf\xf2:", WS_VISIBLE|WS_CHILD, 35, row+24, 55, 20,
-                  hWnd, NULL, NULL, NULL);
-    SendMessage(GetWindow(hWnd, GW_CHILD), WM_SETFONT, (WPARAM)g_hFont, TRUE);
-
-    g_hOrientation = CreateWindowA("COMBOBOX", "",
-                      WS_VISIBLE|WS_CHILD|CBS_DROPDOWNLIST|WS_VSCROLL,
-                      165, row+21, 230, 120, hWnd, (HMENU)(INT_PTR)IDC_ORIENTATION, NULL, NULL);
-    SendMessage(g_hOrientation, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-    { int i; for (i = 0; i < 4; i++)
-        SendMessage(g_hOrientation, CB_ADDSTRING, 0, (LPARAM)oriItems[i]); }
-
-    CreateWindowA("STATIC", "\xce\xbb\xd6\xc3:", WS_VISIBLE|WS_CHILD, 35, row+52, 55, 20,
-                  hWnd, NULL, NULL, NULL);
-    SendMessage(GetWindow(hWnd, GW_CHILD), WM_SETFONT, (WPARAM)g_hFont, TRUE);
-
-    g_hSideL = CreateWindowA("BUTTON", "\xd7\xf3\xb2\xe0",
-                             WS_VISIBLE|WS_CHILD|BS_AUTORADIOBUTTON,
-                             130, row+50, 60, 20, hWnd, (HMENU)(INT_PTR)IDC_SIDE_LEFT, NULL, NULL);
-    SendMessage(g_hSideL, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-
-    g_hSideR = CreateWindowA("BUTTON", "\xd3\xd2\xb2\xe0",
-                             WS_VISIBLE|WS_CHILD|BS_AUTORADIOBUTTON,
-                             200, row+50, 70, 20, hWnd, (HMENU)(INT_PTR)IDC_SIDE_RIGHT, NULL, NULL);
-    SendMessage(g_hSideR, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-
-    CreateWindowA("STATIC", "\xb8\xc4\xce\xbb\xd6\xc3\xba\xf3\xd7\xd4\xb6\xaf\xd3\xa6\xd3\xc3\xb7\xbd\xcf\xf2",
-                  WS_VISIBLE|WS_CHILD, 35, row+76, 350, 22, hWnd, NULL, NULL, NULL);
-    SendMessage(GetWindow(hWnd, GW_CHILD), WM_SETFONT, (WPARAM)g_hFontSmall, TRUE);
-
-    row += 135;
-    CreateWindowA("BUTTON", "\xbf\xec\xbd\xdd\xbc\xfc",
-                  WS_VISIBLE|WS_CHILD|BS_GROUPBOX,
-                  xm, row, ww, 96, hWnd, NULL, NULL, NULL);
-    SendMessage(GetWindow(hWnd, GW_CHILD), WM_SETFONT, (WPARAM)g_hFont, TRUE);
-
-    CreateWindowA("STATIC", "Win + Alt + P    \xc7\xd0\xbb\xbb\xcf\xd4\xca\xbe\xc4\xa3\xca\xbd(\xc4\xda/\xcd\xe2)",
-                  WS_VISIBLE|WS_CHILD, 35, row+22, 500, 18, hWnd, NULL, NULL, NULL);
-    SendMessage(GetWindow(hWnd, GW_CHILD), WM_SETFONT, (WPARAM)g_hFont, TRUE);
-
-    CreateWindowA("STATIC", "Win + Alt + O    \xd1\xad\xbb\xb7\xc7\xd0\xbb\xbb\xb8\xb1\xc6\xc1\xb7\xbd\xcf\xf2",
-                  WS_VISIBLE|WS_CHILD, 35, row+44, 400, 18, hWnd, NULL, NULL, NULL);
-    SendMessage(GetWindow(hWnd, GW_CHILD), WM_SETFONT, (WPARAM)g_hFont, TRUE);
-
-    CreateWindowA("STATIC", "Win + Shift + Tab    \xb4\xb0\xbf\xda\xc7\xd0\xbb\xbb\xc6\xf7",
-                  WS_VISIBLE|WS_CHILD, 35, row+66, 400, 18, hWnd, NULL, NULL, NULL);
-    SendMessage(GetWindow(hWnd, GW_CHILD), WM_SETFONT, (WPARAM)g_hFont, TRUE);
-
-    row += 106;
-    g_hSave = CreateDarkBtn(hWnd, 35, row, 90, 30, "\xb1\xa3\xb4\xe6", IDC_SAVE_BTN);
-    g_hRestore = CreateDarkBtn(hWnd, 140, row, 110, 30, "\xbb\xd6\xb8\xb4\xc4\xac\xc8\xcf", IDC_RESTORE_BTN);
-
-    LoadConfig();
-    g_oldCfg = g_cfg;
-    UpdateControls();
+    ui_widget_on_click(g_wSave, OnSave, NULL);
+    ui_widget_on_click(g_wRestore, OnRestore, NULL);
 }
 
 /* ─── 设置界面入口 ─────────────────────────────────── */
 int RunSettingsGui(HINSTANCE hInst, int nCmdShow) {
-    /* 单实例 */
-    HANDLE hMutex = CreateMutexA(NULL, FALSE, "WindowMoveSettingsMutex");
+    HANDLE hMutex;
+    wchar_t wdir[MAX_PATH], path[MAX_PATH];
+
+    (void)hInst; (void)nCmdShow;
+
+    /* 单实例：已有设置窗口则激活后返回（core-ui 无固定类名，按唯一标题查找） */
+    hMutex = CreateMutexA(NULL, FALSE, "WindowMoveSettingsMutex");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        HWND hW = FindWindowA("WindowMoveSettingsClass", NULL);
+        HWND hW = FindWindowW(NULL, L"Secondary Display Assistant \u2014 \u8bbe\u7f6e");
         if (hW) { ShowWindow(hW, SW_SHOW); SetForegroundWindow(hW); }
         CloseHandle(hMutex);
         return 0;
     }
 
-    WNDCLASSA wc = {0};
-    wc.lpfnWndProc   = SettingsWndProc;
-    wc.hInstance     = hInst;
-    wc.hIcon         = LoadIconA(hInst, MAKEINTRESOURCEA(1));
-    wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground = CreateSolidBrush(RGB(0x20, 0x20, 0x20));
-    wc.lpszClassName = "WindowMoveSettingsClass";
-    RegisterClassA(&wc);
+    LoadConfig();
 
-    /* 字体：系统默认 + 加大 */
-    {
-        LOGFONTA lf;
-        ZeroMemory(&lf, sizeof(lf));
-        lf.lfCharSet = DEFAULT_CHARSET;
-        lf.lfQuality = DEFAULT_QUALITY;
-        lf.lfHeight = -16;
-        g_hFont = CreateFontIndirectA(&lf);
-        lf.lfHeight = -13;
-        g_hFontSmall = CreateFontIndirectA(&lf);
-        lf.lfHeight = -17;
-        lf.lfWeight = FW_SEMIBOLD;
-        g_hFontBold = CreateFontIndirectA(&lf);
+    ui_init_with_theme(UI_THEME_DARK);
+
+    /* 载入 settings.uix（exe 同目录） */
+    MultiByteToWideChar(CP_ACP, 0, g_exeDir, -1, wdir, MAX_PATH);
+    _snwprintf(path, MAX_PATH, L"%s\\settings.uix", wdir);
+    g_page = ui_page_load_file(path);
+    if (!g_page) {
+        MessageBoxW(NULL, L"\u65e0\u6cd5\u52a0\u8f7d\u8bbe\u7f6e\u754c\u9762 settings.uix",
+                    L"Secondary Display Assistant", MB_ICONERROR);
+        ui_shutdown();
+        CloseHandle(hMutex);
+        return 1;
     }
 
-    int winW = 720, winH = 700;
-    RECT wr = {0, 0, winW, winH};
-    AdjustWindowRect(&wr, WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX, FALSE);
-    int adjW = wr.right - wr.left, adjH = wr.bottom - wr.top;
-    int scrW = GetSystemMetrics(SM_CXSCREEN), scrH = GetSystemMetrics(SM_CYSCREEN);
+    g_win = ui_page_open_window(g_page, NULL);
+    if (!g_win) {
+        ui_page_destroy(g_page);
+        g_page = 0;
+        ui_shutdown();
+        CloseHandle(hMutex);
+        return 1;
+    }
+    g_guiHwnd = (HWND)ui_window_hwnd(g_win);
 
-    HWND hWnd = CreateWindowExA(0, "WindowMoveSettingsClass",
-                                "Secondary Display Assistant",
-                                WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,
-                                (scrW-adjW)/2, (scrH-adjH)/2, adjW, adjH,
-                                NULL, NULL, hInst, NULL);
-    if (!hWnd) { CloseHandle(hMutex); return 1; }
-    InitTheme(hWnd);
-    g_guiHwnd = hWnd;
-
-    CreateControls(hWnd);
-
-    ShowWindow(hWnd, nCmdShow);
-    UpdateWindow(hWnd);
-
-    MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
+    ResolveWidgets();
+    if (!g_wStartup || !g_wManualOvr || !g_wManualAct || !g_wTaskbar ||
+        !g_wFullscreen || !g_wSwitcher || !g_wPriScale || !g_wSecScale ||
+        !g_wBright || !g_wOrientation || !g_wSideL || !g_wSideR ||
+        !g_wSave || !g_wRestore) {
+        MessageBoxW(NULL, L"\u8bbe\u7f6e\u754c\u9762\u63a7\u4ef6\u52a0\u8f7d\u5931\u8d25\uff08settings.uix \u4e0e\u7a0b\u5e8f\u7248\u672c\u4e0d\u5339\u914d\uff09",
+                    L"Secondary Display Assistant", MB_ICONERROR);
+        ui_page_destroy(g_page);
+        g_page = 0;
+        ui_shutdown();
+        CloseHandle(hMutex);
+        return 1;
     }
 
-    if (g_hBgBrush)    DeleteObject(g_hBgBrush);
-    if (g_hEditBgBrush) DeleteObject(g_hEditBgBrush);
-    if (g_hFont)      DeleteObject(g_hFont);
-    if (g_hFontSmall) DeleteObject(g_hFontSmall);
-    if (g_hFontBold)  DeleteObject(g_hFontBold);
+    SeedWidgets();          /* 先灌初值，再接回调，避免初始化触发回环 */
+    WireWidgets();
+    ui_window_on_close(g_win, OnWindowClose, NULL);
+
+    ui_run();
+
+    g_guiHwnd     = NULL;
+    g_guiOpenFlag = 0;
+    if (g_page) ui_page_destroy(g_page);
+    g_page = 0;
+    g_win  = 0;
+    ui_shutdown();
     CloseHandle(hMutex);
     return 0;
 }

@@ -1,0 +1,210 @@
+<window title="Secondary Display Assistant — 设置"
+        width="720" height="700"
+        min-width="640" min-height="560"
+        resizable="false" centered="true" theme="dark"/>
+
+<script>
+/* 设置界面 —— Core UI .uix 单文件组件。
+ *
+ * 状态归属约定:
+ *   - <script> 只持有"展示态"(statusText / 亮度百分比文字 / 位置高亮)，
+ *     全部由 C 端通过 ui_page_set_* 推入(int/bool，不推中文字符串，
+ *     中文一律写在本文件的 UTF-8 文本里，避免编码问题)。
+ *   - 交互控件的真实值由 C 端直接读写(ui_widget_find_by_id + 原生回调)，
+ *     模板里对控件只用单向 :enabled / :class 绑定，不用 v-model，
+ *     以免 JS 事件与原生 changed 回调抢占同一条回调槽。
+ */
+export default {
+  data() {
+    return {
+      monCount: 2,             /* C 推入: 显示器数量 */
+      manualOverride: false,   /* C 推入: 是否手动覆盖自动检测(驱动 :enabled) */
+      manualActive: true,      /* C 推入: 手动"启用窗口移动" */
+      side: 0,                 /* C 推入: 0=左侧 1=右侧 */
+      brightness: 0,           /* C 推入: 当前亮度 0..100 */
+      brightnessSupported: true,/* C 推入: 副屏是否支持 DDC/CI */
+      saved: false             /* C 推入: 刚保存的提示标志 */
+    };
+  },
+  computed: {
+    /* 是否处于"启用窗口移动"状态(与原 UpdateControls 的 active 一致) */
+    active() {
+      return this.manualOverride ? this.manualActive : (this.monCount >= 2);
+    },
+    brightnessText() {
+      return this.brightnessSupported ? (this.brightness + '%') : '不支持';
+    },
+    statusText() {
+      var s = this.active ? '已启用' : '已停用';
+      s = s + '  ·  ' + this.monCount + ' 个显示器';
+      if (this.saved) s = s + '  ·  已保存';
+      return s;
+    }
+  }
+}
+</script>
+
+<style>
+  .root {
+    flex-direction: column;
+    padding: 18px;
+    gap: 12px;
+    background: var(--bg);
+  }
+  .status {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--fg);
+  }
+  .hint {
+    font-size: 12px;
+    color: var(--fg);
+    opacity: 0.7;
+  }
+  .scroll {
+    flex: 1;
+  }
+  .stack {
+    flex-direction: column;
+    gap: 12px;
+  }
+  .card {
+    flex-direction: column;
+    gap: 9px;
+    padding: 14px 16px;
+    background: var(--card-bg);
+    border-radius: 8px;
+  }
+  .cardTitle {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--accent);
+  }
+  .field {
+    flex-direction: row;
+    align-items: center;
+    gap: 10px;
+  }
+  .fieldLabel {
+    width: 96px;
+    font-size: 13px;
+    color: var(--fg);
+  }
+  .swLabel {
+    flex: 1;
+    font-size: 13px;
+    color: var(--fg);
+  }
+  .num {
+    width: 90px;
+  }
+  .slider {
+    flex: 1;
+  }
+  .pct {
+    width: 64px;
+    font-size: 13px;
+    color: var(--fg);
+  }
+  button {
+    padding: 6px 16px;
+    border-radius: 4px;
+    font-size: 13px;
+  }
+  .seg {
+    background: transparent;
+    color: var(--fg);
+    padding: 4px 18px;
+  }
+  .seg.on {
+    background: var(--accent);
+    color: #ffffff;
+  }
+  .buttons {
+    flex-direction: row;
+    justify-content: flex-end;
+    gap: 12px;
+  }
+  .primary {
+    background: var(--accent);
+    color: #ffffff;
+  }
+</style>
+
+<template>
+  <div class="root">
+    <label class="status">{{ statusText }}</label>
+    <label class="hint" v-if="monCount < 2">当前仅检测到 {{ monCount }} 个显示器，副屏相关功能暂不可用。</label>
+
+    <ScrollView class="scroll">
+      <div class="stack">
+        <!-- 功能控制 -->
+        <div class="card">
+          <label class="cardTitle">功能控制</label>
+          <div class="field"><label class="swLabel">开机自启动</label><toggle id="startup"/></div>
+          <div class="field"><label class="swLabel">手动覆盖自动检测</label><toggle id="manualOverride"/></div>
+          <div class="field"><label class="swLabel">启用窗口移动</label><toggle id="manualActive" :enabled="manualOverride"/></div>
+          <div class="field"><label class="swLabel">任务栏跨屏移动</label><toggle id="taskbar"/></div>
+          <div class="field"><label class="swLabel">全屏模式（副屏窗口最大化）</label><toggle id="fullscreen"/></div>
+          <div class="field"><label class="swLabel">窗口切换器</label><toggle id="switcher"/></div>
+        </div>
+
+        <!-- DPI 缩放 -->
+        <div class="card">
+          <label class="cardTitle">DPI 缩放比例 (%)</label>
+          <div class="field">
+            <label class="fieldLabel">主屏缩放</label>
+            <input id="primaryScale" type="text" class="num"/>
+          </div>
+          <div class="field">
+            <label class="fieldLabel">副屏缩放</label>
+            <input id="secondaryScale" type="text" class="num"/>
+          </div>
+          <label class="hint">窗口移动到副屏时按此比例自动缩放（50–500）</label>
+        </div>
+
+        <!-- 亮度 -->
+        <div class="card">
+          <label class="cardTitle">亮度调节 (DDC/CI)</label>
+          <div class="field">
+            <input id="brightness" type="range" min="0" max="100" class="slider"/>
+            <label class="pct">{{ brightnessText }}</label>
+          </div>
+        </div>
+
+        <!-- 副屏方向与位置 -->
+        <div class="card">
+          <label class="cardTitle">副屏方向与位置</label>
+          <div class="field">
+            <label class="fieldLabel">方向</label>
+            <select id="orientation">
+              <option>横向 (0°)</option>
+              <option>纵向 (90°)</option>
+              <option>横向翻转 (180°)</option>
+              <option>纵向翻转 (270°)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label class="fieldLabel">位置</label>
+            <button id="sideLeft" :class="side == 0 ? 'seg on' : 'seg'">左侧</button>
+            <button id="sideRight" :class="side == 1 ? 'seg on' : 'seg'">右侧</button>
+          </div>
+          <label class="hint">更改方向或位置后立即作用于副屏</label>
+        </div>
+
+        <!-- 快捷键 -->
+        <div class="card">
+          <label class="cardTitle">快捷键</label>
+          <label class="hint">Win + Alt + P　切换显示模式（内 / 外）</label>
+          <label class="hint">Win + Alt + O　循环切换副屏方向</label>
+          <label class="hint">Win + Shift + Tab　窗口切换器</label>
+        </div>
+      </div>
+    </ScrollView>
+
+    <div class="buttons">
+      <button id="save" class="primary">保存</button>
+      <button id="restore">恢复默认</button>
+    </div>
+  </div>
+</template>
