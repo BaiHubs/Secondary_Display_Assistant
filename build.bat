@@ -41,10 +41,9 @@ if exist "%NAME%.exe" (
     if exist "%NAME%.exe" (echo   OK - no icon) else (echo   FAILED)
 )
 
-echo [4/4] runtime files (core-ui.dll + *.uix) ...
+echo [4/4] runtime file (core-ui.dll) ...
 copy /y core-ui\lib\dynamic\core-ui.dll core-ui.dll >nul
-copy /y src\settings.uix settings.uix >nul
-copy /y src\switcher.uix switcher.uix >nul
+REM *.uix 不再复制到 exe 同目录：程序运行时直接从 src\ 加载（见 ResolveResPath）
 
 echo.
 if exist "%NAME%.exe" (echo   [OK] "%NAME%.exe") else (echo   [..] "%NAME%.exe")

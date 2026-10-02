@@ -255,7 +255,7 @@ static void WireWidgets(void) {
 /* ─── 设置界面入口 ─────────────────────────────────── */
 int RunSettingsGui(HINSTANCE hInst, int nCmdShow) {
     HANDLE hMutex;
-    wchar_t wdir[MAX_PATH], path[MAX_PATH];
+    wchar_t path[MAX_PATH];
 
     (void)hInst; (void)nCmdShow;
 
@@ -272,9 +272,8 @@ int RunSettingsGui(HINSTANCE hInst, int nCmdShow) {
 
     ui_init_with_theme(UI_THEME_DARK);
 
-    /* 载入 settings.uix（exe 同目录） */
-    MultiByteToWideChar(CP_ACP, 0, g_exeDir, -1, wdir, MAX_PATH);
-    _snwprintf(path, MAX_PATH, L"%s\\settings.uix", wdir);
+    /* 载入 settings.uix（优先 <exe>\src\，其次 exe 同目录） */
+    ResolveResPath("settings.uix", path, MAX_PATH);
     g_page = ui_page_load_file(path);
     if (!g_page) {
         MessageBoxW(NULL, L"\u65e0\u6cd5\u52a0\u8f7d\u8bbe\u7f6e\u754c\u9762 settings.uix",

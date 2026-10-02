@@ -447,7 +447,7 @@ static void AltTabShow(void)
 {
     char json[SW_JSON_MAX];
     UiWindowConfig cfg;
-    wchar_t wpath[MAX_PATH], wdir[MAX_PATH];
+    wchar_t wpath[MAX_PATH];
     int gi, maxFit, capCols, monWDip, winW, winH, winWpx, winHpx, x, y;
     RECT mon;
 
@@ -485,8 +485,8 @@ static void AltTabShow(void)
     }
     if (!g_swPage)
     {
-        MultiByteToWideChar(CP_ACP, 0, g_exeDir, -1, wdir, MAX_PATH);
-        _snwprintf(wpath, MAX_PATH, L"%s\\switcher.uix", wdir);
+        /* 载入 switcher.uix（优先 <exe>\src\，其次 exe 同目录） */
+        ResolveResPath("switcher.uix", wpath, MAX_PATH);
         g_swPage = ui_page_load_file(wpath);
         if (!g_swPage)
         {

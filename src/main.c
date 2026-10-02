@@ -42,6 +42,33 @@ static void GetExeDir(void) {
     if (p) *p = '\0';
 }
 
+/* ─── 解析运行时资源（.uix 等）路径 ─────────────────────
+ * 依次在候选目录中查找 name，返回首个存在文件的宽字符路径。
+ * 候选顺序（相对 exe 目录 g_exeDir）：
+ *   1) src\<name>  —— 开发树：.uix 与源码同放 src/，无需 build 时复制到根目录
+ *   2) <name>      —— 发布布局：.uix 与 exe 同目录
+ * 找到返回 1；都找不到返回 0，并把首选路径写入 out 供调用方报错。
+ */
+int ResolveResPath(const char *name, wchar_t *out, int cch) {
+    static const char *cands[] = { "src", "" };
+    char path[MAX_PATH];
+    int i;
+
+    for (i = 0; i < (int)(sizeof(cands) / sizeof(cands[0])); ++i) {
+        if (cands[i][0])
+            _snprintf(path, MAX_PATH, "%s\\%s\\%s", g_exeDir, cands[i], name);
+        else
+            _snprintf(path, MAX_PATH, "%s\\%s", g_exeDir, name);
+        if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) {
+            MultiByteToWideChar(CP_ACP, 0, path, -1, out, cch);
+            return 1;
+        }
+    }
+    _snprintf(path, MAX_PATH, "%s\\src\\%s", g_exeDir, name);
+    MultiByteToWideChar(CP_ACP, 0, path, -1, out, cch);
+    return 0;
+}
+
 /* ─── 依据配置/显示器数量刷新 g_isActive ─────────────── */
 void UpdateActiveState(void) {
     g_isActive = g_cfg.ManualOverride

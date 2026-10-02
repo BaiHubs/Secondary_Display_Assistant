@@ -72,6 +72,7 @@ extern HWND     g_hMainWnd;
 /* main.c — 主入口与全局状态 */
 void  UpdateActiveState(void);
 void  OpenSettingsGui(void);
+int   ResolveResPath(const char *name, wchar_t *out, int cch);
 
 /* wndproc.c — 主窗口消息过程 */
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
