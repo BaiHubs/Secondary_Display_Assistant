@@ -95,5 +95,5 @@ out/
 #cmake-build-*
 CMakePresets.json
 
-# 构建时拷到 exe 同目录的运行时 UI（源在 src/settings.uix）
-/settings.uix
+# 构建时拷到 exe 同目录的运行时 UI（源在 src/*.uix）
+/*.uix

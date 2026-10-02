@@ -46,6 +46,7 @@ add_dependencies(SecondaryDisplayAssistant coreui_implib)
 target_link_libraries(SecondaryDisplayAssistant 
                         dwmapi 
                         comctl32
+                        shcore
                         "${COREUI_IMPLIB}"
                         )
 
@@ -57,4 +58,7 @@ add_custom_command(TARGET SecondaryDisplayAssistant POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_SOURCE_DIR}/src/settings.uix"
             "$<TARGET_FILE_DIR:SecondaryDisplayAssistant>/settings.uix"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/switcher.uix"
+            "$<TARGET_FILE_DIR:SecondaryDisplayAssistant>/switcher.uix"
     COMMENT "Copying core-ui.dll + settings.uix next to the executable")

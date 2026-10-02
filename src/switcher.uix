@@ -1,0 +1,158 @@
+<window
+  title="切换窗口"
+  frameless="true"
+  centered="false"
+  resizable="false"
+  theme="dark"
+/>
+
+<script>
+  /* 切换器界面 —— Core UI .uix。
+   *
+   * 外壳（背景 / 缩略图占位 / 标题 / 选中高亮 / 分组标签 / 操作提示）由本组件渲染；
+   * 缩略图由 C 端注册(DwmRegisterThumbnail)，位置按与下方 CSS 严格一致的算术布局换算。
+   *
+   * 数据来自 C 端：
+   *   ui_page_set_json("groups", ...)
+   *     [ { "isPrimary": true, "cardWidth": 648, "cardHeight": 242,
+   *         "items": [ { "id":0, "gidx":0, "title":"..." }, ... ] }, ... ]
+   *   ui_page_set_int("sel", n)
+   *
+   * ── 关键设计 ──
+   *   每组独立计算列数（副屏只有 1 个窗口 → 1 列，主屏 2 个 → 2 列），C 端把
+   *   每组的 cardWidth / cardHeight 一起发过来，卡片用 :width / :height 明确
+   *   绑定。这样卡片宽度和高度不再依赖 flex-wrap 的 intrinsic size 计算，
+   *   也不会因为 align-items:stretch 被撑满或塌陷。
+   *
+   * ── 与 switcher.c 的常量对应（改动任一侧都必须同步） ──
+   *   PAD_X 28 / PAD_TOP 24 / GROUP_GAP 16 / BOX_PAD 14 / LABEL_H 18 /
+   *   LABEL_GAP 8 / CELL_W 300 / CELL_H 188 / GAP 20 / CAP_H 20 / HINT_H 52
+   *
+   * ── 所有 <div> 必须显式 gap:0 ──
+   *   Core UI 的 <div> 默认 flex-direction:column + gap:4px（不是 CSS 标准的 gap:0）。
+   */
+  export default {
+    data() {
+      return { groups: [], sel: 0 };
+    },
+  };
+</script>
+
+<style>
+  .root {
+    flex-direction: column;
+    gap: 0;
+    background: #1e1e22;
+  }
+
+  /* .groups：组间纵向堆叠，align-items:flex-start 让卡片按自身宽度放置，
+     不被 stretch 撑满父容器 */
+  .groups {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 16px; /* GROUP_GAP */
+    padding-top: 24px; /* PAD_TOP */
+    padding-left: 28px; /* PAD_X */
+    padding-right: 28px; /* PAD_X */
+  }
+
+  /* .group：卡片宽高由 C 端 :width / :height 明确给出，这里不再写死。
+     显式 gap:0 防止库默认 4px 影响内部网格位置。 */
+  .group {
+    flex-direction: column;
+    flex: 0 0 auto;
+    gap: 8px; /* LABEL_GAP */
+    padding: 14px; /* BOX_PAD */
+    background: #26262e;
+    border-radius: 10px;
+  }
+
+  .gtag {
+    height: 18px; /* LABEL_H */
+    line-height: 18px;
+    font-size: 13px;
+    font-weight: 600;
+    color: #7aa2ff;
+  }
+  .gtag.alt {
+    color: #e0a63a;
+  }
+
+  .grid {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: 20px; /* GAP */
+  }
+
+  /* .slot / .cell：尺寸写死 + 禁止收缩，保证与 C 端算术布局完全一致 */
+  .slot {
+    flex-direction: row;
+    gap: 0;
+    width: 300px; /* CELL_W */
+    height: 188px; /* SLOT_H == CELL_H */
+    flex: 0 0 auto;
+  }
+
+  .cell {
+    flex-direction: column;
+    justify-content: flex-end; /* 标题贴底 */
+    gap: 0;
+    width: 300px; /* CELL_W */
+    height: 188px; /* CELL_H */
+    flex: 0 0 auto;
+    background: #2a2a31;
+    border-radius: 10px;
+  }
+  .cell.on {
+    box-shadow: 0 0 0 3px #2b6cff;
+  }
+
+  .cap {
+    width: 300px; /* CELL_W */
+    height: 20px; /* CAP_H */
+    line-height: 20px;
+    font-size: 13px;
+    color: #eaeaec;
+    text-align: center;
+    white-space: nowrap;
+    overflow: hidden;
+  }
+
+  .hint {
+    padding-top: 14px;
+    padding-bottom: 20px;
+    padding-left: 28px; /* PAD_X */
+    padding-right: 28px; /* PAD_X */
+    font-size: 13px;
+    line-height: 18px;
+    color: #9a9aa2;
+    text-align: center;
+  }
+</style>
+
+<template>
+  <div class="root">
+    <div class="groups">
+      <div
+        v-for="(g, gi) in groups"
+        :key="gi"
+        class="group"
+        :width="g.cardWidth"
+        :height="g.cardHeight"
+      >
+        <label :class="g.isPrimary ? 'gtag' : 'gtag alt'">{{
+          g.isPrimary ? "主屏" : "副屏"
+        }}</label>
+        <div class="grid">
+          <div v-for="it in g.items" :key="it.id" class="slot">
+            <div :class="it.gidx == sel ? 'cell on' : 'cell'">
+              <label class="cap">{{ it.title }}</label>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="hint">方向键选择 · Enter 确认 · Esc 或点击空白处取消</div>
+  </div>
+</template>

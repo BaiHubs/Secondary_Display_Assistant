@@ -1,453 +1,670 @@
-/* switcher.c — 窗口切换器
+/* switcher.c — Alt+Tab 仿原生切换器（DWM 实时缩略图 + Core UI .uix 界面）
  *
- * 包含两套切换 UI 与对外消息接口：
- *   1) 旧版文本列表切换器 ShowMonitorSwitcher()（保留；当前主流程未调用）；
- *   2) Alt+Tab 仿原生缩略图切换器（DWM 缩略图叠加窗口，
- *      经 SwitcherStartFromHotkey() 或 WM_USER 系列消息驱动）。
+ * 枚举可见应用窗口 → 按所在显示器分组 → 用 switcher.uix 渲染外壳
+ * （分组标签 / 缩略图占位 / 标题 / 选中高亮 / 操作提示）→ 在槽位上注册 DWM
+ * 实时缩略图。旧版文本列表切换器（ShowMonitorSwitcher）已删除。
+ *
+ * 布局：**每组独立计算列数**（副屏只有 1 个窗口 → 1 列，主屏 2 个 → 2 列），
+ * 每组卡片宽度由本组列数决定，卡片之间纵向堆叠并以「主屏 / 副屏」标签划界。
+ * 每组的 cardWidth / cardHeight 通过 groups JSON 发给 .uix，卡片用 :width /
+ * :height 明确绑定，这样卡片宽度和高度不再依赖 flex 的 intrinsic size 计算。
+ * 窗口尺寸取**最大组**的卡片宽度 + 统一左右外边距，缩略图 rcDestination 由与
+ * .uix CSS 一致的算术布局换算，并按**目标显示器** DPI 缩放。
  *
  * 对外接口（供 hotkeys.c / wndproc.c 使用）：
- *   SwitcherHandleMessage() 处理 WM_USER+200 系列自定义消息
- *   SwitcherStartFromHotkey() 热键唤起
+ *   SwitcherStartFromHotkey()  热键唤起
+ *   SwitcherHandleMessage()    兼容保留（当前无自定义消息）
+ *
+ * 依赖：Core UI（ui_core.h）+ shcore；主进程 DPI 感知须为 Per-Monitor V2
+ *       （见 main.c），core-ui / GetDpiForMonitor 才能取到监视器真实 DPI。
  */
 #include "winmover.h"
+#include "ui_core.h"
+#include <shellscalingapi.h>
 
-/* ─── 切换器自定义消息（发送给主窗口） ───────────────── */
-#define WM_SW_SHOW     (WM_USER + 200)   /* 请求显示切换器 */
-#define WM_SW_CYCLE    (WM_USER + 201)   /* 循环选择（wParam = ±1） */
-#define WM_SW_CONFIRM  (WM_USER + 202)   /* 确认选择 */
-#define WM_SW_CANCEL   (WM_USER + 203)   /* 取消 */
-#define WM_SW_DOSHOW   (WM_USER + 210)   /* 实际创建并显示叠加窗口 */
+/* ─── 布局常量（须与 switcher.uix 的样式保持一致） ─── */
+#define PAD_X 28                                            /* .groups 左/右内边距 */
+#define PAD_TOP 24                                          /* .groups 上内边距 */
+#define GROUP_GAP 16                                        /* .groups gap（组间距） */
+#define BOX_PAD 14                                          /* .group 内边距（分组卡片） */
+#define LABEL_H 18                                          /* .gtag 高 */
+#define LABEL_GAP 8                                         /* .group gap（标签与网格间距） */
+#define GTH (BOX_PAD + LABEL_H + LABEL_GAP)                 /* 卡片顶 → 网格 */
+#define BOX_EXTRA (BOX_PAD + LABEL_H + LABEL_GAP + BOX_PAD) /* 卡片高 = gridH + BOX_EXTRA */
+#define CELL_W 300                                          /* .cell 宽 */
+#define CELL_H 188                                          /* .cell 高 */
+#define GAP 20                                              /* .grid gap（行/列间距） */
+#define CAP_GAP 8                                           /* .slot gap */
+#define CAP_H 20                                            /* .cap 高 */
+#define SLOT_H (CELL_H)                                     /* 槽位高 = 单元高（标题在单元内底部） */
+#define HINT_H 52                                           /* 提示行（上14 + 文18 + 下20） */
+#define MAX_COLS 4                                          /* 每排最多几个，超出即换排（两排 / 多排） */
 
-/* ─── 内部状态 ───────────────────────────────────────── */
-static int   g_switcherActive = 0;       /* 切换器是否处于激活状态 */
-static POINT g_swHookCursor   = {0, 0};  /* 唤起时的光标位置（决定目标屏） */
+#define MAX_GROUPS 8
+#define MAX_PER_GRP 12
+#define MAX_TOTAL (MAX_GROUPS * MAX_PER_GRP)
+#define SW_JSON_MAX 32768
 
-/* ─── 切换器函数前向声明 ─────────────────────────────── */
-static void AltTabShow(void);
-static void AltTabCycle(int dir);
-static void AltTabConfirm(void);
-static void AltTabCancel(void);
+typedef struct
+{
+    HWND hwnd;
+    char title[768];
+} SwWin;
+typedef struct
+{
+    HMONITOR mon;
+    int isPrim;
+    int n;
+    int cols; /* 本组列数（每组独立算） */
+    SwWin w[MAX_PER_GRP];
+} SwGroup;
 
-/* ═══════════════════════════════════════════════════════
- * 一、旧版文本列表切换器（ShowMonitorSwitcher）
- * ═══════════════════════════════════════════════════════ */
-typedef struct { HWND hWnd; char title[256]; } WinEntry;
+static SwGroup g_grp[MAX_GROUPS];
+static int g_grpCount = 0;
+static HWND g_targets[MAX_TOTAL]; /* 渲染顺序 → 窗口句柄 */
+static RECT g_cellHit[MAX_TOTAL]; /* 渲染顺序 → 槽位命中矩形(DIP) */
+static HTHUMBNAIL g_thumbs[MAX_TOTAL];
+static int g_swTotal = 0;
 
-/* 辅助：将窗口移到光标所在屏幕（居中 800x600） */
-static void MoveWinToCursorMon(HWND hWnd) {
-    POINT pt; GetCursorPos(&pt);
-    HMONITOR hMonMouse = MonitorFromPoint(pt, MONITOR_DEFAULTTONULL);
-    HMONITOR hMonWnd = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONULL);
-    if (hMonMouse && hMonWnd && hMonMouse != hMonWnd) {
-        RECT rc; GetMonitorRect(hMonMouse, &rc);
-        int cx = rc.left + (rc.right - rc.left - 800) / 2;
-        int cy = rc.top + (rc.bottom - rc.top - 600) / 2;
-        SetWindowPos(hWnd, NULL, cx > 0 ? cx : 0, cy > 0 ? cy : 0,
-                     800, 600, SWP_NOZORDER | SWP_NOACTIVATE);
-    }
-}
-
-void ShowMonitorSwitcher(void) {
-    static int busy = 0;
-    if (busy) return;
-    busy = 1;
-    WinEntry prim[64], sec[64];
-    int primCnt = 0, secCnt = 0, total = 0;
-
-    /* 枚举窗口，按主屏/副屏分组 */
-    HWND hWnd = GetTopWindow(NULL);
-    while (hWnd && total < 128) {
-        if (IsWindowVisible(hWnd) && IsRealAppWindow(hWnd)) {
-            char title[256];
-            if (GetWindowTextA(hWnd, title, sizeof(title)) && title[0]) {
-                HMONITOR hMon = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONULL);
-                if (hMon && IsPrimaryMonitor(hMon) && primCnt < 64)
-                    { prim[primCnt].hWnd = hWnd; strcpy(prim[primCnt].title, title); primCnt++; total++; }
-                else if (hMon && !IsPrimaryMonitor(hMon) && secCnt < 64)
-                    { sec[secCnt].hWnd = hWnd; strcpy(sec[secCnt].title, title); secCnt++; total++; }
-            }
-        }
-        hWnd = GetNextWindow(hWnd, GW_HWNDNEXT);
-    }
-    if (total == 0) return;
-
-    /* 构建显示文本 */
-    char txt[4096] = "";
-    strcat(txt, "=== \xd6\xf7\xc6\xc1 \xb4\xb0\xbf\xda ===\r\n");
-    for (int i = 0; i < primCnt; i++) {
-        char line[300]; _snprintf(line, sizeof(line), " [%d] %s\r\n", i+1, prim[i].title);
-        strcat(txt, line);
-    }
-    strcat(txt, "\r\n=== \xb8\xb1\xc6\xc1 \xb4\xb0\xbf\xda ===\r\n");
-    for (int i = 0; i < secCnt; i++) {
-        char line[300]; _snprintf(line, sizeof(line), " [%d] %s\r\n", primCnt+i+1, sec[i].title);
-        strcat(txt, line);
-    }
-
-    /* 在光标所在屏幕创建叠加窗口 */
-    POINT pt; GetCursorPos(&pt);
-    HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONULL);
-    RECT rcMon = {0}; GetMonitorRect(hMon, &rcMon);
-    int winW = 500, winH = 400;
-    int x = rcMon.left + (rcMon.right - rcMon.left - winW) / 2;
-    int y = rcMon.top + (rcMon.bottom - rcMon.top - winH) / 2;
-
-    HWND hOverlay = CreateWindowExA(WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-        "STATIC", "Alt+Tab \xd4\xf6\xc7\xbf \xb4\xb0\xbf\xda\xc7\xd0\xbb\xbb",
-        WS_VISIBLE | WS_POPUP | WS_CAPTION | WS_SYSMENU,
-        x, y, winW, winH, NULL, NULL, g_hInst, NULL);
-    if (!hOverlay) { MessageBoxA(0, txt, "Window Switcher", MB_OK); return; }
-
-    HWND hText = CreateWindowExA(0, "EDIT", txt,
-        WS_VISIBLE | WS_CHILD | ES_MULTILINE | ES_READONLY | WS_VSCROLL,
-        10, 10, winW-25, winH-60, hOverlay, NULL, g_hInst, NULL);
-    SendMessageA(hText, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
-    SetForegroundWindow(hOverlay);
-
-    /* 消息循环（PeekMessage 不阻塞主窗口消息处理） */
-    MSG msg;
-    int done = 0;
-    while (!done && IsWindow(hOverlay)) {
-        while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_KEYDOWN) {
-                int vk = (int)msg.wParam;
-                if (vk >= '1' && vk <= '9') {
-                    int idx = vk - '0';
-                    HWND target = NULL;
-                    if (idx >= 1 && idx <= primCnt) target = prim[idx-1].hWnd;
-                    else if (idx > primCnt && idx <= total) target = sec[idx-primCnt-1].hWnd;
-                    if (target) { MoveWinToCursorMon(target); SetForegroundWindow(target); }
-                    done = 1; break;
-                }
-                if (vk == VK_ESCAPE) { done = 1; break; }
-            }
-            if (msg.message == WM_DESTROY) { done = 1; break; }
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
-        }
-        if (!done) Sleep(20);
-    }
-    if (IsWindow(hOverlay)) DestroyWindow(hOverlay);
-    busy = 0;
-}
-
-/* ═══════════════════════════════════════════════════════
- * 二、Alt+Tab 仿原生切换器（DWM 缩略图）
- * ═══════════════════════════════════════════════════════ */
-#define THUMB_W 300
-#define THUMB_H 200
-#define TITLE_H 36
-#define MARGIN  30
-#define GAP     20
-#define GAP_ROW 80
-#define SEP_W   2
-
-typedef struct { HWND hwnd; HTHUMBNAIL thumb; char title[256];
-                 int isPrimary; RECT rcDst; } SwItem;
-static SwItem g_swItems[64];
-static int g_swCount = 0, g_swSel = 0;
+static int g_swActive = 0;
+static int g_swInited = 0;
+static UiPage g_swPage = 0;
+static UiWindow g_swWin = 0;
 static HWND g_swHwnd = NULL;
-static HMONITOR g_swTargetMon = NULL;
+static float g_swDpi = 1.0f;
+static HMONITOR g_swMon = NULL;
+static POINT g_swHookCursor = {0, 0};
+static int g_swDone = 0;
+static int g_swConfirm = 0;
+static HWND g_swPick = NULL;
+static int g_swShown = 0;
+static WNDPROC g_swOrigProc = NULL;
 
-/* 叠加窗口过程：绘制背景/选中框/标题/标签，处理鼠标与键盘 */
-static LRESULT CALLBACK SwitcherWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    if (msg == WM_PAINT) {
-        PAINTSTRUCT ps; HDC hdc = BeginPaint(hWnd, &ps);
-        RECT rc; GetClientRect(hWnd, &rc);
+static void AltTabShow(void);
 
-        /* 背景 */
-        HBRUSH bg = CreateSolidBrush(RGB(0x1E, 0x1E, 0x1E));
-        FillRect(hdc, &rc, bg);
-        DeleteObject(bg);
+/* ─── ANSI → UTF-8 ─────────────────────────────────── */
+static void AnsiToUtf8(const char *src, char *out, int cap)
+{
+    wchar_t wbuf[512];
+    int n = MultiByteToWideChar(CP_ACP, 0, src, -1, wbuf, 512);
+    if (n <= 0)
+    {
+        if (cap > 0)
+            out[0] = 0;
+        return;
+    }
+    WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, out, cap, NULL, NULL);
+    out[cap - 1] = 0;
+}
 
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, RGB(0xFF, 0xFF, 0xFF));
-
-        /* 绘制选中框 */
-        if (g_swSel >= 0 && g_swSel < g_swCount) {
-            RECT *sr = &g_swItems[g_swSel].rcDst;
-            HPEN pen = CreatePen(PS_SOLID, 2, RGB(0x00, 0x78, 0xD7));
-            HGDIOBJ old = SelectObject(hdc, pen);
-            HBRUSH oldBr = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
-            Rectangle(hdc, sr->left-3, sr->top-3, sr->right+3, sr->bottom+3);
-            SelectObject(hdc, old); SelectObject(hdc, oldBr);
-            DeleteObject(pen);
-        }
-
-        /* 窗口标题 */
-        HFONT font = CreateFontA(-16, 0,0,0, FW_NORMAL,0,0,0, DEFAULT_CHARSET,0,0,0,0,"Segoe UI");
-        HGDIOBJ oldF = SelectObject(hdc, font);
-        for (int i = 0; i < g_swCount; i++) {
-            RECT tr = {g_swItems[i].rcDst.left, g_swItems[i].rcDst.bottom + 4,
-                       g_swItems[i].rcDst.right, g_swItems[i].rcDst.bottom + TITLE_H};
-            DrawTextA(hdc, g_swItems[i].title, -1, &tr,
-                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-        }
-        SelectObject(hdc, oldF); DeleteObject(font);
-
-        /* 底部提示 */
+/* ─── JSON 字符串转义（追加写入 dst） ───────────────── */
+static void JsonAppendEscaped(char *dst, int cap, const char *s)
+{
+    int len = (int)strlen(dst);
+    while (*s && len < cap - 2)
+    {
+        char c = *s++;
+        if (c == '"' || c == '\\')
         {
-            HFONT hf = CreateFontA(-12,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,0,0,"Segoe UI");
-            HGDIOBJ of = SelectObject(hdc, hf);
-            SetTextColor(hdc, RGB(0xAA,0xAA,0xAA));
-            RECT br = {MARGIN, rc.bottom-22, rc.right-MARGIN, rc.bottom-4};
-            DrawTextA(hdc, "\xb7\xbd\xcf\xf2\xbc\xfc\xc7\xd0\xbb\xbb  Enter\xc8\xb7\xc8\xcf  Esc\xc8\xa1\xcf\xfb  \xcb\xab\xbb\xf7\xcb\xab\xbc\xfe\xd1\xa1\xd6\xd0",
-                      -1, &br, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            SelectObject(hdc, of); DeleteObject(hf);
+            dst[len++] = '\\';
+            dst[len++] = c;
         }
+        else if ((unsigned char)c < 0x20)
+        { /* 丢弃控制字符 */
+        }
+        else
+            dst[len++] = c;
+    }
+    dst[len] = 0;
+}
 
-        /* 主屏/副屏标签与分隔 */
+/* ─── 目标显示器 DPI 缩放（非感知进程会返回 96，故主进程须 PMv2） ─── */
+static float MonScale(HMONITOR mon)
+{
+    UINT dx = 96, dy = 96;
+    if (mon && SUCCEEDED(GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &dx, &dy)) && dx > 0)
+        return (float)dx / 96.0f;
+    return 1.0f;
+}
+
+/* ─── 读取页面当前 sel ─────────────────────────────── */
+static int ReadSel(void)
+{
+    char *j = ui_page_get_json(g_swPage, "sel");
+    int s = (j ? atoi(j) : 0);
+    if (j)
+        ui_page_free(j);
+    return s;
+}
+
+/* ─── 结束切换器：confirm=1 激活第 idx 个窗口，否则取消 ─── */
+static void SwDone(int confirm, int idx)
+{
+    g_swDone = 1;
+    g_swConfirm = confirm;
+    g_swPick = (confirm && idx >= 0 && idx < g_swTotal) ? g_targets[idx] : NULL;
+    ReleaseCapture(); /* 释放鼠标捕获：否则隐藏(不销毁)后仍被本进程占有 → 光标闪烁 */
+    ui_quit(0);
+}
+
+/* ─── 键盘：方向循环 / Enter 确认 / Esc 取消 ─────────── */
+static void OnKey(UiWindow win, int vk, void *ud)
+{
+    (void)win;
+    (void)ud;
+    if (g_swDone)
+        return;
+    if (vk == VK_LEFT || vk == VK_UP || vk == VK_RIGHT || vk == VK_DOWN)
+    {
+        int dir = (vk == VK_LEFT || vk == VK_UP) ? -1 : 1;
+        int s = ReadSel();
+        if (g_swTotal > 0)
+            s = (s + dir + g_swTotal) % g_swTotal;
+        ui_page_set_int(g_swPage, "sel", s);
+    }
+    else if (vk == VK_RETURN || vk == VK_SPACE)
+    {
+        SwDone(1, ReadSel());
+    }
+    else if (vk == VK_ESCAPE)
+    {
+        SwDone(0, -1);
+    }
+}
+
+/* ─── 窗口子类化：点击窗口外即关闭（鼠标捕获方案）。
+ *   · WA_ACTIVE：SetCapture —— 窗口激活后，窗口外任意位置的鼠标按下都会
+ *     作为 WM_LBUTTONDOWN 送到本窗口，从而"点窗口外任意处一点即关闭"；
+ *   · WM_LBUTTONDOWN：坐标在客户区外 → 关闭；客户区内 → 命中缩略图则激活；
+ *   · WA_INACTIVE：释放捕获（失去前台后不再拦截别处点击）。 ─── */
+static LRESULT CALLBACK SwSubclassProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if (!g_swDone && g_swShown)
+    {
+        if (msg == WM_ACTIVATE)
         {
-            int pCnt = 0; for (int i = 0; i < g_swCount; i++) if (g_swItems[i].isPrimary) pCnt++;
-            int twoRows = (g_swCount > pCnt && pCnt > 0 &&
-                (g_swCount * (THUMB_W + GAP) + MARGIN * 2) > (rc.right - rc.left));
-            if (pCnt > 0 && pCnt < g_swCount) {
-                if (twoRows) {
-                    /* 双行：第一行上方标"主屏"，第二行上方标"副屏" */
-                    RECT lbl1 = {MARGIN, 4, rc.right - MARGIN, MARGIN};
-                    int lbl2y = MARGIN + THUMB_H + GAP_ROW/2 - 6;
-                    RECT lbl2 = {MARGIN, lbl2y, rc.right - MARGIN, lbl2y + 22};
-                    DrawTextA(hdc, "\xd6\xf7\xc6\xc1", -1, &lbl1, DT_CENTER | DT_TOP | DT_SINGLELINE);
-                    DrawTextA(hdc, "\xb8\xb1\xc6\xc1", -1, &lbl2, DT_CENTER | DT_TOP | DT_SINGLELINE);
-                } else {
-                    /* 单行：左"主屏"，右"副屏"，中间分隔线 */
-                    int sepX = (g_swItems[pCnt-1].rcDst.right + g_swItems[pCnt].rcDst.left) / 2;
-                    RECT lL = {MARGIN, 4, sepX - 6, MARGIN};
-                    RECT rL = {sepX + 6, 4, rc.right - MARGIN, MARGIN};
-                    DrawTextA(hdc, "\xd6\xf7\xc6\xc1", -1, &lL, DT_RIGHT | DT_BOTTOM | DT_SINGLELINE);
-                    DrawTextA(hdc, "\xb8\xb1\xc6\xc1", -1, &rL, DT_LEFT | DT_BOTTOM | DT_SINGLELINE);
-                    HPEN pen = CreatePen(PS_SOLID, SEP_W, RGB(0x55,0x55,0x55));
-                    HGDIOBJ oldP = SelectObject(hdc, pen);
-                    MoveToEx(hdc, sepX, 10, NULL);
-                    LineTo(hdc, sepX, rc.bottom - 10);
-                    SelectObject(hdc, oldP); DeleteObject(pen);
+            if (LOWORD(wp) == WA_ACTIVE)
+                SetCapture(hWnd);
+            else if (LOWORD(wp) == WA_INACTIVE)
+                ReleaseCapture();
+        }
+        else if (msg == WM_LBUTTONDOWN)
+        {
+            int mx = (int)(short)LOWORD(lp), my = (int)(short)HIWORD(lp);
+            RECT rc;
+            GetClientRect(hWnd, &rc);
+            if (mx < rc.left || my < rc.top || mx >= rc.right || my >= rc.bottom)
+            {
+                /* 点击点落在窗口之外 → 关闭 */
+                ReleaseCapture();
+                SwDone(0, -1);
+            }
+            else
+            {
+                /* 客户区物理像素 → DIP，命中缩略图则激活 */
+                int cx = (int)(mx / g_swDpi), cy = (int)(my / g_swDpi);
+                int i;
+                for (i = 0; i < g_swTotal; i++)
+                {
+                    RECT *r = &g_cellHit[i];
+                    if (cx >= r->left && cx < r->right && cy >= r->top && cy < r->bottom)
+                    {
+                        ReleaseCapture();
+                        SwDone(1, i); /* 点中缩略图 → 激活对应窗口 */
+                        break;
+                    }
                 }
             }
         }
-        EndPaint(hWnd, &ps);
-        return 0;
     }
-    if (msg == WM_LBUTTONDOWN) {
-        int mx = LOWORD(lParam), my = HIWORD(lParam);
-        for (int i = 0; i < g_swCount; i++) {
-            if (mx >= g_swItems[i].rcDst.left && mx <= g_swItems[i].rcDst.right &&
-                my >= g_swItems[i].rcDst.top - 5 &&
-                my <= g_swItems[i].rcDst.bottom + TITLE_H + 5) {
-                g_swSel = i; InvalidateRect(hWnd, NULL, TRUE);
-                /* 鼠标单击选中，双击确认 */
-                break;
-            }
-        }
-        return 0;
-    }
-    if (msg == WM_LBUTTONDBLCLK) {
-        int mx = LOWORD(lParam), my = HIWORD(lParam);
-        for (int i = 0; i < g_swCount; i++) {
-            if (mx >= g_swItems[i].rcDst.left && mx <= g_swItems[i].rcDst.right &&
-                my >= g_swItems[i].rcDst.top - 5 &&
-                my <= g_swItems[i].rcDst.bottom + TITLE_H + 5) {
-                g_swSel = i; AltTabConfirm();
-                break;
-            }
-        }
-        return 0;
-    }
-    if (msg == WM_KEYDOWN) {
-        switch (wParam) {
-        case VK_LEFT: case VK_UP:
-            PostMessageA(g_hMainWnd, WM_SW_CYCLE, -1, 0); return 0;
-        case VK_RIGHT: case VK_DOWN:
-            PostMessageA(g_hMainWnd, WM_SW_CYCLE, 1, 0); return 0;
-        case VK_RETURN: case VK_SPACE:
-            PostMessageA(g_hMainWnd, WM_SW_CONFIRM, 0, 0); return 0;
-        case VK_ESCAPE:
-            PostMessageA(g_hMainWnd, WM_SW_CANCEL, 0, 0); return 0;
-        }
-        return 0;
-    }
-    if (msg == WM_ACTIVATE && LOWORD(wParam) == WA_INACTIVE) {
-        PostMessageA(g_hMainWnd, WM_SW_CANCEL, 0, 0);
-        return 0;
-    }
-    if (msg == WM_ERASEBKGND) return 1;
-    return DefWindowProcA(hWnd, msg, wParam, lParam);
+    return CallWindowProcW(g_swOrigProc, hWnd, msg, wp, lp);
 }
 
-/* ─── 创建并显示切换器叠加窗口 ───────────────────────── */
-static void AltTabShow(void) {
-    if (!g_cfg.SwitcherEnabled) { g_switcherActive = 0; return; }
-    g_swCount = 0;
+/* ─── 枚举窗口 → 按所在显示器分组（主屏组在前，其余按屏幕左边界排序） ─── */
+static void CollectGroups(void)
+{
     HWND hWnd = GetTopWindow(NULL);
-    while (hWnd && g_swCount < 64) {
-        if (IsWindowVisible(hWnd) && IsRealAppWindow(hWnd)) {
-            char title[256];
-            if (GetWindowTextA(hWnd, title, sizeof(title)) && title[0]) {
-                HMONITOR hm = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONULL);
-                g_swItems[g_swCount].hwnd = hWnd;
-                g_swItems[g_swCount].thumb = NULL;
-                strcpy(g_swItems[g_swCount].title, title);
-                g_swItems[g_swCount].isPrimary = (hm && IsPrimaryMonitor(hm)) ? 1 : 0;
-                g_swCount++;
+    int i, j;
+    g_grpCount = 0;
+    while (hWnd)
+    {
+        if (IsWindowVisible(hWnd) && IsRealAppWindow(hWnd))
+        {
+            char titleA[256];
+            if (GetWindowTextA(hWnd, titleA, sizeof(titleA)) && titleA[0])
+            {
+                HMONITOR hm = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST);
+                int gi = -1;
+                for (i = 0; i < g_grpCount; i++)
+                    if (g_grp[i].mon == hm)
+                    {
+                        gi = i;
+                        break;
+                    }
+                if (gi < 0)
+                {
+                    if (g_grpCount >= MAX_GROUPS)
+                        goto next;
+                    gi = g_grpCount++;
+                    g_grp[gi].mon = hm;
+                    g_grp[gi].isPrim = IsPrimaryMonitor(hm);
+                    g_grp[gi].n = 0;
+                    g_grp[gi].cols = 1;
+                }
+                if (g_grp[gi].n < MAX_PER_GRP)
+                {
+                    SwWin *w = &g_grp[gi].w[g_grp[gi].n++];
+                    w->hwnd = hWnd;
+                    AnsiToUtf8(titleA, w->title, sizeof(w->title));
+                }
             }
         }
+    next:
         hWnd = GetNextWindow(hWnd, GW_HWNDNEXT);
     }
-    if (g_swCount == 0) { g_switcherActive = 0; return; }
-
-    /* 使用钩子中记录的光标位置确定目标屏幕 */
+    /* 组排序：主屏优先，其次按屏幕左边界 */
+    for (i = 1; i < g_grpCount; i++)
     {
-        g_swTargetMon = MonitorFromPoint(g_swHookCursor, MONITOR_DEFAULTTONULL);
-        if (!g_swTargetMon || g_swTargetMon == GetPrimaryMonitorHandle()) {
-            /* 钩子位置无效或指向主屏 → 用当前光标位置重新检测 */
-            POINT pt; GetCursorPos(&pt);
-            g_swTargetMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONULL);
-            if (!g_swTargetMon) g_swTargetMon = GetPrimaryMonitorHandle();
+        SwGroup key = g_grp[i];
+        RECT kr;
+        GetMonitorRect(key.mon, &kr);
+        j = i - 1;
+        while (j >= 0)
+        {
+            RECT jr;
+            GetMonitorRect(g_grp[j].mon, &jr);
+            int keepBefore = (g_grp[j].isPrim && !key.isPrim) ||
+                             (g_grp[j].isPrim == key.isPrim && jr.left <= kr.left);
+            if (keepBefore)
+                break;
+            g_grp[j + 1] = g_grp[j];
+            j--;
         }
+        g_grp[j + 1] = key;
     }
-    RECT rcMon; GetMonitorRect(g_swTargetMon, &rcMon);
+}
 
-    /* 确定显示行数：单行或双行 */
-    int pCnt = 0; for (int i = 0; i < g_swCount; i++) if (g_swItems[i].isPrimary) pCnt++;
-    int sCnt = g_swCount - pCnt;
-    int monW = rcMon.right - rcMon.left;
-    int gapRow = GAP_ROW;
-    int twoRows = (g_swCount * (THUMB_W + GAP) + MARGIN * 2 > monW) && pCnt > 0 && sCnt > 0;
-    int itemsPerRow = twoRows ? (pCnt > sCnt ? pCnt : sCnt) : g_swCount;
-    int maxFit = (monW - MARGIN * 2) / (THUMB_W + GAP);
-    if (itemsPerRow > maxFit) itemsPerRow = maxFit;
-    int totalW = itemsPerRow * (THUMB_W + GAP) + MARGIN * 2;
-    int totalH = (twoRows ? 2 : 1) * (THUMB_H + gapRow) + TITLE_H + MARGIN * 2 + 20;
-    int cx = rcMon.left + (monW - totalW) / 2;
-    int cy = rcMon.top + (rcMon.bottom - rcMon.top - totalH) / 2;
-    if (cx < rcMon.left + 5) cx = rcMon.left + 5;
-
-    /* 注册窗口类 */
-    static int reg = 0;
-    if (!reg) {
-        WNDCLASSA wc = {0};
-        wc.style = CS_DBLCLKS;
-        wc.lpfnWndProc = SwitcherWndProc;
-        wc.hInstance = g_hInst;
-        wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
-        wc.lpszClassName = "AltTabSwitcherClass";
-        RegisterClassA(&wc); reg = 1;
-    }
-
-    g_swHwnd = CreateWindowExA(WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-        "AltTabSwitcherClass", NULL, WS_POPUP,
-        cx, cy, totalW, totalH, NULL, NULL, g_hInst, NULL);
-    if (!g_swHwnd) { g_switcherActive = 0; return; }
-
-    /* 重排：主屏窗口在前，副屏在后（避免 Z-order 交叠导致 col 冲突） */
+/* ─── 组装 groups JSON（Chinese 标签留给 .uix，C 只发 isPrimary）
+ *   每组额外发 cardWidth / cardHeight，让 .uix 用 :width / :height 明确绑定，
+ *   避免依赖 flex 的 intrinsic size 计算导致卡片塌陷 / 被 stretch。 ─── */
+static void BuildJson(char *json)
+{
+    int gi, k, len = 0, gidx = 0;
+    json[len++] = '[';
+    json[len] = 0;
+    for (gi = 0; gi < g_grpCount; gi++)
     {
-        SwItem sorted[64]; int n = 0;
-        for (int i = 0; i < g_swCount; i++) if (g_swItems[i].isPrimary) sorted[n++] = g_swItems[i];
-        for (int i = 0; i < g_swCount; i++) if (!g_swItems[i].isPrimary) sorted[n++] = g_swItems[i];
-        memcpy(g_swItems, sorted, sizeof(SwItem) * g_swCount);
-    }
-
-    int row1Y = MARGIN;
-    int row2Y = MARGIN + THUMB_H + gapRow;
-    int contentW = itemsPerRow * (THUMB_W + GAP) - GAP;
-    int startX = MARGIN + (totalW - MARGIN * 2 - contentW) / 2;
-    for (int i = 0; i < g_swCount; i++) {
-        int rowIdx = twoRows ? (i < pCnt ? 0 : 1) : 0; /* 主屏row0, 副屏row1 */
-        int colInRow = twoRows ? (rowIdx == 0 ? i : i - pCnt) : i;
-        int rowY = rowIdx == 0 ? row1Y : row2Y;
-        int x = startX + colInRow * (THUMB_W + GAP);
-        g_swItems[i].rcDst = (RECT){x, rowY, x + THUMB_W, rowY + THUMB_H};
-    }
-
-    /* 注册 DWM 缩略图 */
-    for (int i = 0; i < g_swCount; i++) {
-        DwmRegisterThumbnail(g_swHwnd, g_swItems[i].hwnd, &g_swItems[i].thumb);
-        if (g_swItems[i].thumb) {
-            DWM_THUMBNAIL_PROPERTIES dtp;
-            ZeroMemory(&dtp, sizeof(dtp));
-            dtp.dwFlags = DWM_TNP_VISIBLE | DWM_TNP_RECTDESTINATION | DWM_TNP_OPACITY;
-            dtp.fVisible = TRUE;
-            dtp.rcDestination = g_swItems[i].rcDst;
-            dtp.opacity = 230;
-            DwmUpdateThumbnailProperties(g_swItems[i].thumb, &dtp);
+        char gbuf[160];
+        int cols = g_grp[gi].cols;
+        int n = g_grp[gi].n;
+        int rows = (n + cols - 1) / cols;
+        int cw = 2 * BOX_PAD + cols * CELL_W + (cols - 1) * GAP;
+        int ch = BOX_EXTRA + rows * CELL_H + (rows - 1) * GAP;
+        _snprintf(gbuf, sizeof(gbuf),
+                  "%s{\"isPrimary\":%s,\"cardWidth\":%d,\"cardHeight\":%d,\"items\":[",
+                  gi ? "," : "", g_grp[gi].isPrim ? "true" : "false", cw, ch);
+        strcat(json, gbuf);
+        len += (int)strlen(gbuf);
+        for (k = 0; k < n; k++)
+        {
+            char item[1200];
+            g_targets[gidx] = g_grp[gi].w[k].hwnd;
+            _snprintf(item, sizeof(item), "%s{\"id\":%d,\"gidx\":%d,\"title\":\"",
+                      k ? "," : "", gidx, gidx);
+            JsonAppendEscaped(item, sizeof(item), g_grp[gi].w[k].title);
+            strcat(item, "\"}");
+            if (len + (int)strlen(item) >= SW_JSON_MAX - 2)
+                break;
+            strcat(json, item);
+            len += (int)strlen(item);
+            gidx++;
         }
+        strcat(json, "]}");
+        len += 2;
+    }
+    strcat(json, "]");
+    g_swTotal = gidx;
+}
+
+/* ─── 注册 DWM 缩略图：每组用**本组**列数算位置。
+ *   缩略图按**源窗口自身宽高比**等比缩小、居中放在槽位里（留黑边），
+ *   而不是拉伸填满整个槽位 —— 看起来就是"那个窗口被缩小了"。 ─── */
+static void RegisterThumbs(void)
+{
+    int gi, k, gidx = 0;
+    int y = PAD_TOP; /* 当前组卡片顶部（.groups 内容坐标，DIP） */
+    for (gi = 0; gi < g_grpCount; gi++)
+    {
+        int n = g_grp[gi].n;
+        int columns = g_grp[gi].cols; /* 本组列数 */
+        int rows = (n + columns - 1) / columns;
+        int gridTop = y + GTH;
+        for (k = 0; k < n; k++)
+        {
+            int row = k / columns, col = k % columns;
+            float cxd = (float)(PAD_X + BOX_PAD + col * (CELL_W + GAP)); /* 槽位左上(DIP) */
+            float cyd = (float)(gridTop + row * (SLOT_H + GAP));
+            float cellL = cxd * g_swDpi, cellT = cyd * g_swDpi; /* 槽位左上(物理) */
+            float cellW = (float)CELL_W * g_swDpi;
+            float cellH = (float)(CELL_H - CAP_H) * g_swDpi; /* 底部预留标题条 */
+
+            /* 命中矩形（DIP，整槽含标题，用于点击判定） */
+            g_cellHit[gidx].left = (LONG)cxd;
+            g_cellHit[gidx].top = (LONG)cyd;
+            g_cellHit[gidx].right = (LONG)(cxd + CELL_W);
+            g_cellHit[gidx].bottom = (LONG)(cyd + SLOT_H);
+
+            g_thumbs[gidx] = NULL;
+            if (g_targets[gidx] &&
+                DwmRegisterThumbnail(g_swHwnd, g_targets[gidx], &g_thumbs[gidx]) == S_OK && g_thumbs[gidx])
+            {
+                SIZE src = {0, 0};
+                int sw = 0, sh = 0;
+                float sc, tw, th, offx, offy;
+                RECT r;
+                DWM_THUMBNAIL_PROPERTIES dtp;
+
+                DwmQueryThumbnailSourceSize(g_thumbs[gidx], &src);
+                sw = src.cx;
+                sh = src.cy;
+                if (sw <= 0 || sh <= 0) /* 兜底：用源窗口矩形 */
+                {
+                    RECT wr;
+                    if (GetWindowRect(g_targets[gidx], &wr))
+                    {
+                        sw = wr.right - wr.left;
+                        sh = wr.bottom - wr.top;
+                    }
+                }
+                if (sw <= 0 || sh <= 0)
+                {
+                    sw = (int)cellW;
+                    sh = (int)cellH;
+                }
+
+                /* 等比缩放到能放进槽位，居中 */
+                sc = cellW / (float)sw;
+                if (cellH / (float)sh < sc)
+                    sc = cellH / (float)sh;
+                tw = sw * sc;
+                th = sh * sc;
+                offx = (cellW - tw) / 2.0f;
+                offy = (cellH - th) / 2.0f;
+
+                r.left = (LONG)(cellL + offx);
+                r.top = (LONG)(cellT + offy);
+                r.right = (LONG)(cellL + offx + tw);
+                r.bottom = (LONG)(cellT + offy + th);
+
+                ZeroMemory(&dtp, sizeof(dtp));
+                dtp.dwFlags = DWM_TNP_VISIBLE | DWM_TNP_RECTDESTINATION | DWM_TNP_OPACITY;
+                dtp.fVisible = TRUE;
+                dtp.opacity = 255;
+                dtp.rcDestination = r;
+                DwmUpdateThumbnailProperties(g_thumbs[gidx], &dtp);
+            }
+            gidx++;
+        }
+        y += rows * SLOT_H + (rows - 1) * GAP + BOX_EXTRA + GROUP_GAP;
+    }
+}
+
+/* ─── 计算窗口高度（DIP）：每组用**本组**列数 ─── */
+static int CalcWinH(void)
+{
+    int gi, h = PAD_TOP;
+    for (gi = 0; gi < g_grpCount; gi++)
+    {
+        int n = g_grp[gi].n;
+        int columns = g_grp[gi].cols;
+        int rows = (n + columns - 1) / columns;
+        h += rows * SLOT_H + (rows - 1) * GAP + BOX_EXTRA;
+    }
+    h += (g_grpCount > 0 ? (g_grpCount - 1) * GROUP_GAP : 0) + HINT_H;
+    return h;
+}
+
+/* ─── 清理：注销缩略图并隐藏窗口（窗口/页面复用，不销毁） ─── */
+static void SwCleanup(void)
+{
+    int i;
+    for (i = 0; i < MAX_TOTAL; i++)
+        if (g_thumbs[i])
+        {
+            DwmUnregisterThumbnail(g_thumbs[i]);
+            g_thumbs[i] = NULL;
+        }
+    if (g_swWin)
+    {
+        ReleaseCapture(); /* 兜底：隐藏前确保释放鼠标捕获 */
+        ui_window_hide(g_swWin);
+    }
+    g_swTotal = 0;
+}
+
+/* ─── 显示切换器 ───────────────────────────────────── */
+static void AltTabShow(void)
+{
+    char json[SW_JSON_MAX];
+    UiWindowConfig cfg;
+    wchar_t wpath[MAX_PATH], wdir[MAX_PATH];
+    int gi, maxFit, capCols, monWDip, winW, winH, winWpx, winHpx, x, y;
+    RECT mon;
+
+    g_swDone = 0;
+    g_swConfirm = 0;
+    g_swPick = NULL;
+    memset(g_targets, 0, sizeof(g_targets));
+    memset(g_thumbs, 0, sizeof(g_thumbs));
+    memset(g_cellHit, 0, sizeof(g_cellHit));
+
+    CollectGroups();
+    if (g_grpCount == 0)
+    {
+        g_swActive = 0;
+        return;
     }
 
-    g_swSel = 0;
-    ShowWindow(g_swHwnd, SW_SHOW);
+    /* 目标屏（钩子位置优先，否则当前光标） */
+    g_swMon = MonitorFromPoint(g_swHookCursor, MONITOR_DEFAULTTONULL);
+    if (!g_swMon || g_swMon == GetPrimaryMonitorHandle())
+    {
+        POINT pt;
+        GetCursorPos(&pt);
+        g_swMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONULL);
+        if (!g_swMon)
+            g_swMon = GetPrimaryMonitorHandle();
+    }
+    /* Core UI 初始化 + 窗口只建一次，之后复用（销毁会触发退出竞争）。
+       注意：必须在取目标屏矩形/DPI 之前 init —— ui_init 才把本进程设为 PMv2，
+       否则 GetMonitorInfo / GetDpiForMonitor 拿到的是虚拟化坐标。 */
+    if (!g_swInited)
+    {
+        ui_init_with_theme(UI_THEME_DARK);
+        g_swInited = 1;
+    }
+    if (!g_swPage)
+    {
+        MultiByteToWideChar(CP_ACP, 0, g_exeDir, -1, wdir, MAX_PATH);
+        _snwprintf(wpath, MAX_PATH, L"%s\\switcher.uix", wdir);
+        g_swPage = ui_page_load_file(wpath);
+        if (!g_swPage)
+        {
+            g_swActive = 0;
+            return;
+        }
+        ZeroMemory(&cfg, sizeof(cfg));
+        cfg.width = PAD_X * 2 + CELL_W;
+        cfg.height = 300; /* 临时，稍后重设 */
+        cfg.tool_window = 1;
+        cfg.skip_animation = 1;
+        g_swWin = ui_page_prepare_window(g_swPage, &cfg);
+        if (!g_swWin)
+        {
+            ui_page_destroy(g_swPage);
+            g_swPage = 0;
+            g_swActive = 0;
+            return;
+        }
+        g_swHwnd = (HWND)ui_window_hwnd(g_swWin);
+        ui_window_on_key(g_swWin, OnKey, NULL);
+        g_swOrigProc = (WNDPROC)SetWindowLongPtrW(g_swHwnd, GWLP_WNDPROC, (LONG_PTR)SwSubclassProc);
+    }
+
+    /* 目标屏 DPI + 矩形（须在 ui_init 之后：PMv2 生效后坐标才是物理像素） */
+    g_swDpi = MonScale(g_swMon);
+    GetMonitorRect(g_swMon, &mon);
+    monWDip = (int)((mon.right - mon.left) / g_swDpi);
+
+    /* 每组独立算列数：按屏幕能放下的数与 MAX_COLS 取上限，
+       再在组内**平衡**成若干排（避免"最后一行只剩 1 个"）。 */
+    maxFit = (monWDip - 2 * (PAD_X + BOX_PAD) + GAP) / (CELL_W + GAP);
+    if (maxFit < 1)
+        maxFit = 1;
+    capCols = maxFit < MAX_COLS ? maxFit : MAX_COLS;
+    for (gi = 0; gi < g_grpCount; gi++)
+    {
+        int n = g_grp[gi].n;
+        int r = (n + capCols - 1) / capCols; /* 先按满排算行数 */
+        int c = (n + r - 1) / r;             /* 再按行数平衡列数 */
+        if (c > capCols)
+            c = capCols;
+        if (c < 1)
+            c = 1;
+        g_grp[gi].cols = c;
+    }
+
+    BuildJson(json);
+    if (ui_page_set_json(g_swPage, "groups", json) != 0)
+    {
+        SwCleanup();
+        g_swActive = 0;
+        return;
+    }
+    ui_page_set_int(g_swPage, "sel", 0);
+    if (g_swTotal == 0)
+    {
+        SwCleanup();
+        g_swActive = 0;
+        return;
+    }
+
+    /* 窗口宽度取**最大组**的卡片宽度 + 统一左右外边距；高度由各组 rows 累加。 */
+    {
+        int maxCardW = 0;
+        for (gi = 0; gi < g_grpCount; gi++)
+        {
+            int cols = g_grp[gi].cols;
+            int cw = 2 * BOX_PAD + cols * CELL_W + (cols - 1) * GAP;
+            if (cw > maxCardW)
+                maxCardW = cw;
+        }
+        winW = 2 * PAD_X + maxCardW;
+    }
+    winH = CalcWinH();
+
+    /* 居中于目标屏 + 置顶 + 设最终尺寸（x/y=屏幕像素, w/h=DIP） */
+    winWpx = (int)(winW * g_swDpi);
+    winHpx = (int)(winH * g_swDpi);
+    x = mon.left + ((mon.right - mon.left) - winWpx) / 2;
+    y = mon.top + ((mon.bottom - mon.top) - winHpx) / 2;
+    if (x < mon.left + 4)
+        x = mon.left + 4;
+    if (y < mon.top + 4)
+        y = mon.top + 4;
+
+    ui_window_set_rect(g_swWin, x, y, winW, winH); /* 先定尺寸 */
+    ui_window_show_immediate(g_swWin);
+    /* show 之后再原子地定位+定尺寸（物理像素）到目标屏正中 —— 之前"没居中"
+       就是因为在 show 之前设的位置被 show 的默认摆放覆盖了。 */
+    SetWindowPos(g_swHwnd, HWND_TOPMOST, x, y, winWpx, winHpx, SWP_NOACTIVATE);
     SetForegroundWindow(g_swHwnd);
     SetFocus(g_swHwnd);
-    InvalidateRect(g_swHwnd, NULL, TRUE);
-}
 
-/* ─── 循环移动选择 ───────────────────────────────────── */
-static void AltTabCycle(int dir) {
-    g_swSel = (g_swSel + dir + g_swCount) % g_swCount;
-    InvalidateRect(g_swHwnd, NULL, TRUE);
-}
+    RegisterThumbs();
 
-/* ─── 确认选择：必要时把目标窗口移到目标屏并激活 ─────── */
-static void AltTabConfirm(void) {
-    if (g_swSel < 0 || g_swSel >= g_swCount) { AltTabCancel(); return; }
-    HWND target = g_swItems[g_swSel].hwnd;
-    if (g_swTargetMon) {
-        HMONITOR hMonW = MonitorFromWindow(target, MONITOR_DEFAULTTONULL);
-        if (hMonW && hMonW != g_swTargetMon) {
-            MoveWindowToMonitor(target, g_swTargetMon, g_fullScreenMode);
-        }
+    g_swShown = 1;
+    ui_run(); /* 嵌套消息循环，直到确认 / 取消 */
+    g_swShown = 0;
+
+    /* 确认：必要时把目标窗口移到目标屏并激活（已在该屏则不动） */
+    if (g_swConfirm && g_swPick)
+    {
+        HMONITOR hMonW = MonitorFromWindow(g_swPick, MONITOR_DEFAULTTONEAREST);
+        if (hMonW && g_swMon && hMonW != g_swMon)
+            MoveWindowToMonitor(g_swPick, g_swMon, g_fullScreenMode);
+        SwitchToThisWindow(g_swPick, TRUE);
     }
-    /* 使用 SwitchToThisWindow 激活目标窗口（兼容 explorer.exe 等跨进程场景） */
-    SwitchToThisWindow(target, TRUE);
-    AltTabCancel();
-}
 
-/* ─── 取消：注销缩略图并销毁叠加窗口 ─────────────────── */
-static void AltTabCancel(void) {
-    g_switcherActive = 0;
-    if (g_swHwnd) {
-        for (int i = 0; i < g_swCount; i++)
-            if (g_swItems[i].thumb) DwmUnregisterThumbnail(g_swItems[i].thumb);
-        DestroyWindow(g_swHwnd);
-        g_swHwnd = NULL;
-    }
+    SwCleanup();
+    g_swActive = 0;
 }
 
 /* ═══════════════════════════════════════════════════════
- * 三、对外接口
+ * 对外接口
  * ═══════════════════════════════════════════════════════ */
 
-/* 处理切换器自定义消息：返回非 0 表示已处理 */
-int SwitcherHandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
+/* 兼容 wndproc.c 的调用；当前切换器不再使用自定义消息 */
+int SwitcherHandleMessage(UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    (void)msg;
+    (void)wParam;
     (void)lParam;
-    switch (msg) {
-    case WM_SW_SHOW:    /* 请求显示 */
-        if (!g_switcherActive) {
-            g_switcherActive = 1;
-            PostMessageA(g_hMainWnd, WM_SW_DOSHOW, 0, 0);
-        }
-        return 1;
-    case WM_SW_CYCLE:   /* 循环选择 */
-        if (g_switcherActive)
-            AltTabCycle((int)wParam);
-        return 1;
-    case WM_SW_CONFIRM: /* 确认选择 */
-        if (g_switcherActive)
-            AltTabConfirm();
-        return 1;
-    case WM_SW_CANCEL:  /* 取消 */
-        if (g_switcherActive)
-            AltTabCancel();
-        return 1;
-    case WM_SW_DOSHOW:  /* 实际显示叠加窗口 */
-        AltTabShow();
-        return 1;
-    }
     return 0;
 }
 
-/* 热键唤起：记录光标位置并显示切换器（已激活时忽略） */
-void SwitcherStartFromHotkey(void) {
-    if (g_switcherActive) return;
-    g_switcherActive = 1;
-    GetCursorPos(&g_swHookCursor);
-    AltTabShow();
+/* 热键唤起：以**独立进程**启动切换器。
+ *   这样 core-ui 的运行时内存(D3D11/D2D/DComp/QuickJS/页面)只在切换器进程存活
+ *   期间占用，托盘本体不再常驻；关闭即随进程归还。单实例由子进程的互斥体保证。 */
+void SwitcherStartFromHotkey(void)
+{
+    char exe[MAX_PATH];
+    if (!g_cfg.SwitcherEnabled)
+        return;
+    GetModuleFileNameA(NULL, exe, MAX_PATH);
+    AllowSetForegroundWindow(ASFW_ANY); /* best-effort：让子进程能抢前台（SetCapture 需要） */
+    ShellExecuteA(NULL, "open", exe, "--switcher", NULL, SW_SHOWNORMAL);
+}
+
+/* --switcher 入口：在独立进程里跑一次切换器。
+ *   与 --settings 一样：刻意不设 SetProcessDPIAware，留给 core-ui 设 PMv2。 */
+int RunSwitcherProcess(HINSTANCE hInst, int nCmdShow)
+{
+    HANDLE hMutex;
+    (void)hInst;
+    (void)nCmdShow;
+
+    /* 单实例：已有一个切换器进程在跑就直接退出，避免热键连按开一堆 */
+    hMutex = CreateMutexA(NULL, FALSE, "WindowMoveSwitcherMutex");
+    if (GetLastError() == ERROR_ALREADY_EXISTS)
+    {
+        CloseHandle(hMutex);
+        return 0;
+    }
+
+    LoadConfig();
+    g_fullScreenMode = g_cfg.FullScreenMode; /* 供"把目标窗口移到目标屏"时决定是否全屏 */
+    GetCursorPos(&g_swHookCursor);           /* 用唤起时的光标位置决定目标屏 */
+
+    AltTabShow(); /* init core-ui + 显示 + ui_run + 激活目标 + 清理 */
+
+    /* 独立进程：退出前释放 core-ui，内存随进程归还 */
+    if (g_swWin)
+    {
+        ui_window_destroy(g_swWin);
+        g_swWin = 0;
+    }
+    if (g_swPage)
+    {
+        ui_page_destroy(g_swPage);
+        g_swPage = 0;
+    }
+    if (g_swInited)
+    {
+        ui_shutdown();
+        g_swInited = 0;
+    }
+
+    CloseHandle(hMutex);
+    return 0;
 }

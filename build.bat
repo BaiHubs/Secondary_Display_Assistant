@@ -20,7 +20,7 @@ taskkill /f /im "Secondary Display Assistant.exe" >nul 2>&1
 set NAME=Secondary Display Assistant
 REM core-ui 是 MSVC 预编译库，MinGW 侧用 gendef+dlltool 从 DLL 生成导入库后链接
 set CFLAGS=-O2 -s -mwindows -fexec-charset=GBK -Icore-ui/include
-set LIBS=-Lcore-ui/lib/mingw -lcore-ui -lcomctl32 -ldwmapi -lgdi32 -luser32
+set LIBS=-Lcore-ui/lib/mingw -lcore-ui -lcomctl32 -ldwmapi -lshcore -lgdi32 -luser32
 
 set SRC=src\main.c src\wndproc.c src\hotkeys.c src\shellhook.c src\window_filter.c src\switcher.c src\tray.c src\config.c src\monitor.c src\move.c src\brightness.c src\display_cmd.c src\settings.c
 
@@ -41,9 +41,10 @@ if exist "%NAME%.exe" (
     if exist "%NAME%.exe" (echo   OK - no icon) else (echo   FAILED)
 )
 
-echo [4/4] runtime files (core-ui.dll + settings.uix) ...
+echo [4/4] runtime files (core-ui.dll + *.uix) ...
 copy /y core-ui\lib\dynamic\core-ui.dll core-ui.dll >nul
 copy /y src\settings.uix settings.uix >nul
+copy /y src\switcher.uix switcher.uix >nul
 
 echo.
 if exist "%NAME%.exe" (echo   [OK] "%NAME%.exe") else (echo   [..] "%NAME%.exe")

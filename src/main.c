@@ -77,7 +77,15 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nCmdShow) 
         return RunSettingsGui(hInst, nCmdShow);
     }
 
-    SetProcessDPIAware();
+    /* --switcher 参数 → 以独立进程运行切换器：core-ui 的运行时内存只在切换器
+       进程存活期间占用，托盘本体不再常驻；单实例由子进程互斥体保证。 */
+    if (lpCmd && lpCmd[0] && strstr(lpCmd, "--switcher")) {
+        return RunSwitcherProcess(hInst, nCmdShow);
+    }
+
+    /* 进程 DPI 感知：设为 Per-Monitor V2（只能设一次）。
+       托盘为纯 Win32；--settings / --switcher 子进程各自交给 core-ui 设 PMv2。 */
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     /* 单实例：已有实例则激活后退出 */
     HANDLE hMutex = CreateMutexA(NULL, FALSE, "WindowMoveMutex");

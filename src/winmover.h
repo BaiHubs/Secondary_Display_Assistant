@@ -112,9 +112,9 @@ void  RegisterAppHotKeys(HWND hWnd);
 void  HandleHotKey(int id);
 
 /* switcher.c — 窗口切换器 */
-void  ShowMonitorSwitcher(void);
 int   SwitcherHandleMessage(UINT msg, WPARAM wParam, LPARAM lParam);
 void  SwitcherStartFromHotkey(void);
+int   RunSwitcherProcess(HINSTANCE hInst, int nCmdShow);
 
 /* tray.c — 托盘图标与菜单 */
 void  CreateTrayIcon(HWND hWnd);
