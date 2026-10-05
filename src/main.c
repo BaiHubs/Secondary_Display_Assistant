@@ -71,6 +71,7 @@ int ResolveResPath(const char *name, wchar_t *out, int cch) {
 
 /* ─── 依据配置/显示器数量刷新 g_isActive ─────────────── */
 void UpdateActiveState(void) {
+    InvalidatePrimaryMonitor();   /* 显示器可能已变化，主屏缓存先失效 */
     g_isActive = g_cfg.ManualOverride
                  ? g_cfg.ManualActive
                  : (GetMonitorCount() >= 2);

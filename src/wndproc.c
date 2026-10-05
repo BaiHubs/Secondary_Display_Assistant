@@ -38,6 +38,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         TrayHandleMessage(hWnd, wParam, lParam);
         return 0;
 
+    case WM_DISPLAYCHANGE:
+        InvalidatePrimaryMonitor();   /* 分辨率/拓扑变化 → 主屏缓存失效 */
+        return 0;
+
     case WM_DESTROY:
         DestroyTrayIcon(hWnd);
         PostQuitMessage(0);

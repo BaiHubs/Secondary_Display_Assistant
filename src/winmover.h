@@ -90,6 +90,7 @@ void  CheckIniChanged(void);
 int   GetMonitorCount(void);
 int   IsPrimaryMonitor(HMONITOR hMon);
 HMONITOR GetPrimaryMonitorHandle(void);
+void  InvalidatePrimaryMonitor(void);  /* 显示器拓扑变化后失效主屏缓存 */
 HMONITOR GetMonitorFromWindowEx(HWND hWnd);
 HMONITOR GetMonitorFromPointEx(int x, int y);
 int   GetMonitorRect(HMONITOR hMon, RECT *rc);
@@ -103,6 +104,7 @@ void  DelayedMove(HWND hWnd, HMONITOR hMonMouse);
 /* window_filter.c — 窗口筛选 / 分类 */
 int   IsExcludedWindow(HWND hWnd);
 int   IsRealAppWindow(HWND hWnd);
+int   IsSystemClass(HWND hWnd);
 
 /* shellhook.c — Shell 钩子 */
 void  ShellHookInit(HWND hWnd);

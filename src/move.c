@@ -32,12 +32,28 @@ static void ResizeWindowForMonitor(HWND hWnd, HMONITOR currMon, HMONITOR tgtMon,
     *outH = newH;
 }
 
+/* ─── 移动前还原已最小化 / 最大化的窗口 ─────────────────
+ * 最大化窗口直接 SetWindowPos 不会真正移动（仍贴合原屏），需先还原为普通窗口
+ * 位置才生效（参照 GrabAndMove HandleDragMove）。切换器确认路径同样受益。 */
+static void RestoreWindowForMove(HWND hWnd) {
+    if (IsIconic(hWnd)) {
+        ShowWindow(hWnd, SW_RESTORE);
+        Sleep(60);   /* 等最小化动画结束，以便取到还原后的矩形 */
+    } else if (IsZoomed(hWnd)) {
+        ShowWindow(hWnd, SW_RESTORE);
+        Sleep(30);
+    }
+}
+
 /* ─── 移动窗口到目标显示器 ──────────────────────────── */
 void MoveWindowToMonitor(HWND hWnd, HMONITOR hTarget, int fullScreen) {
     RECT rcMon;
     if (!GetMonitorRect(hTarget, &rcMon)) return;
     int mL = rcMon.left, mT = rcMon.top;
     int mR = rcMon.right, mB = rcMon.bottom;
+
+    /* 先还原最小化 / 最大化，后面的 GetWindowRect 才能取到真实尺寸 */
+    RestoreWindowForMove(hWnd);
 
     int isPrimaryTarget = IsPrimaryMonitor(hTarget);
     RECT rcWnd;
@@ -64,15 +80,21 @@ void MoveWindowToMonitor(HWND hWnd, HMONITOR hTarget, int fullScreen) {
         return;
     }
 
-    /* 非全屏模式：按 DPI 缩放 */
+    /* 非全屏模式：按 DPI 缩放，并在“工作区”内居中 + 夹取（避开任务栏） */
+    RECT rcWork;
+    if (!GetMonitorWorkRect(hTarget, &rcWork)) rcWork = rcMon;
+    int wL = rcWork.left, wT = rcWork.top, wR = rcWork.right, wB = rcWork.bottom;
+
     HMONITOR hCurr = GetMonitorFromWindowEx(hWnd);
     ResizeWindowForMonitor(hWnd, hCurr, hTarget, &ww, &wh);
 
-    int newX = mL + (mR - mL - ww) / 2;
-    int newY = mT + (mB - mT - wh) / 2;
-    if (newY < mT + 30) newY = mT + 30;
-    if (newY + wh > mB) newY = mB - wh;
-    if (newY < mT) newY = mT;
+    int newX = wL + (wR - wL - ww) / 2;
+    int newY = wT + (wB - wT - wh) / 2;
+    if (newY < wT + 30) newY = wT + 30;
+    if (newY + wh > wB) newY = wB - wh;
+    if (newY < wT) newY = wT;
+    if (newX + ww > wR) newX = wR - ww;
+    if (newX < wL) newX = wL;
 
     SetWindowPos(hWnd, NULL, newX, newY, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE);
 }
@@ -87,7 +109,7 @@ void DelayedMove(HWND hWnd, HMONITOR hMonMouse) {
     if (hCurr == hMonMouse) return;
 
     LONG style = GetWindowLongA(hWnd, GWL_STYLE);
-    if (!(style & 0xC00000) && !(style & 0x40000)) return;
+    if (!(style & WS_CAPTION) && !(style & WS_THICKFRAME)) return;
 
     g_movingFlag = 1;
     MoveWindowToMonitor(hWnd, hMonMouse, g_fullScreenMode);

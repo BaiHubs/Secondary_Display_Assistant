@@ -8,6 +8,44 @@
  */
 #include "winmover.h"
 
+/* ─── 系统窗口类名判定（供筛选与 Shell 钩子共用） ───────
+ * 这些窗口类不应被当作可移动的应用窗口：桌面/背景、主副任务栏、托盘溢出与
+ * 提示、弹出菜单、任务视图、系统浮出、截图/取色/工具窗等。
+ * 注意：UWP 应用的最外层类 ApplicationFrameWindow **刻意不在此列** —— 它是
+ * 设置/计算器等 UWP 应用的宿主，应可移动（参照 GrabAndMove：仅按进程路径过滤
+ * shell 体验窗口，而非整类排除）。 */
+int IsSystemClass(HWND hWnd) {
+    char cls[64] = {0};
+    if (!GetClassNameA(hWnd, cls, sizeof(cls))) return 0;
+    static const char *known[] = {
+        /* 桌面 / 背景 */
+        "Progman", "WorkerW",
+        /* 主 / 副任务栏 */
+        "Shell_TrayWnd", "Shell_SecondaryTrayWnd",
+        /* 托盘溢出 / 提示气泡 */
+        "NotifyIconOverflowWindow", "TopLevelWindowForOverflowXamlIsland",
+        "tooltips_class32",
+        /* 弹出菜单 */
+        "#32768",
+        /* 任务视图 Win+Tab */
+        "MultitaskingViewFrame", "XamlExplorerHostIslandWindow",
+        /* 系统浮出（快速设置 / 输入法切换） */
+        "Windows.UI.Composition.DesktopWindowContentBridge",
+        "Shell_InputSwitchTopLevelWindow",
+        /* 截图 / 取色 / 工具窗 / 输入法候选（原 IsExcludedWindow 清单） */
+        "Crosshair", "SnipWindow", "GDI+ Hook Window Class",
+        "CiceroUIWndFrame", "Qt5QWindowIcon",
+        "Windows.UI.Core.CoreWindow",
+        "Intermediate D3D Window", "OverlayWindow",
+        "PopupHost", "ScreenClippingHost",
+        NULL
+    };
+    for (int i = 0; known[i]; i++) {
+        if (strcmp(cls, known[i]) == 0) return 1;
+    }
+    return 0;
+}
+
 /* ─── 排除临时窗口 ────────────────────────────────────── */
 int IsExcludedWindow(HWND hWnd) {
     if (!IsWindow(hWnd)) return 1;
@@ -17,13 +55,13 @@ int IsExcludedWindow(HWND hWnd) {
     LONG exStyle = GetWindowLongA(hWnd, GWL_EXSTYLE);
 
     /* WS_EX_TOOLWINDOW */
-    if (exStyle & 0x80) return 1;
+    if (exStyle & WS_EX_TOOLWINDOW) return 1;
     /* WS_EX_NOACTIVATE + 无标题栏 */
-    if ((exStyle & 0x80000) && !(style & 0xC00000)) return 1;
+    if ((exStyle & WS_EX_NOACTIVATE) && !(style & WS_CAPTION)) return 1;
     /* WS_EX_TRANSPARENT */
-    if (exStyle & 0x20) return 1;
+    if (exStyle & WS_EX_TRANSPARENT) return 1;
     /* 无标题栏且太小 */
-    if (!(style & 0xC00000)) {
+    if (!(style & WS_CAPTION)) {
         RECT rc;
         if (GetWindowRect(hWnd, &rc)) {
             if ((rc.right - rc.left) < 100 && (rc.bottom - rc.top) < 100)
@@ -31,20 +69,8 @@ int IsExcludedWindow(HWND hWnd) {
         }
     }
 
-    /* 已知类名排除 */
-    char cls[64];
-    if (GetClassNameA(hWnd, cls, sizeof(cls))) {
-        static const char *known[] = {
-            "Crosshair", "SnipWindow", "GDI+ Hook Window Class",
-            "CiceroUIWndFrame", "Qt5QWindowIcon",
-            "Windows.UI.Core.CoreWindow", "ApplicationFrameWindow",
-            "Intermediate D3D Window", "OverlayWindow",
-            "PopupHost", "ScreenClippingHost", NULL
-        };
-        for (int i = 0; known[i]; i++) {
-            if (strcmp(cls, known[i]) == 0) return 1;
-        }
-    }
+    /* 系统类名排除 */
+    if (IsSystemClass(hWnd)) return 1;
     return 0;
 }
 
@@ -63,17 +89,8 @@ int IsRealAppWindow(HWND hWnd) {
     if (!GetWindowTextA(hWnd, title, sizeof(title))) return 0;
     if (title[0] == '\0') return 0;
 
-    /* 检查窗口类名 — 排除桌面和任务栏，保留文件资源管理器 */
-    char cls[64];
-    if (GetClassNameA(hWnd, cls, sizeof(cls))) {
-        if (strcmp(cls, "Progman") == 0 ||         /* 桌面 */
-            strcmp(cls, "WorkerW") == 0 ||           /* 桌面背景 */
-            strcmp(cls, "Shell_TrayWnd") == 0 ||     /* 任务栏 */
-            strcmp(cls, "Shell_SecondaryTrayWnd") == 0)
-            return 0;
-    }
-
-    /* 排除系统进程（保留 explorer.exe — 文件资源管理器可移动） */
+    /* 排除系统进程（保留 explorer.exe — 文件资源管理器可移动；shell 体验窗口
+       如开始菜单/搜索/Widgets 按进程路径排除，参照 GrabAndMove 的 IsExcluded） */
     DWORD pid = 0;
     GetWindowThreadProcessId(hWnd, &pid);
     if (!pid) return 0;
@@ -85,7 +102,11 @@ int IsRealAppWindow(HWND hWnd) {
             fn = fn ? fn + 1 : path;
             if (_stricmp(fn, "svchost.exe")  == 0 ||
                 _stricmp(fn, "rundll32.exe") == 0 ||
-                _stricmp(fn, "shellexperiencehost.exe") == 0) {
+                _stricmp(fn, "shellexperiencehost.exe") == 0 ||
+                _stricmp(fn, "startmenuexperiencehost.exe") == 0 ||
+                _stricmp(fn, "searchhost.exe") == 0 ||
+                _stricmp(fn, "shellhost.exe") == 0 ||
+                _stricmp(fn, "widgetboard.exe") == 0) {
                 CloseHandle(hp);
                 return 0;
             }

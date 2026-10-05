@@ -34,10 +34,24 @@ static BOOL CALLBACK EnumFindMon(HMONITOR hMon, HDC hdc, LPRECT rc, LPARAM lp) {
     return TRUE;
 }
 
+/* 主屏句柄缓存：避免 IsPrimaryMonitor()/GetMonitorScale() 每次重新枚举。
+   显示器拓扑变化时由 InvalidatePrimaryMonitor() 失效
+   （已接入 UpdateActiveState() 与 WM_DISPLAYCHANGE）。 */
+static HMONITOR g_primaryMon    = NULL;
+static int      g_primaryCached = 0;
+
+void InvalidatePrimaryMonitor(void) {
+    g_primaryMon    = NULL;
+    g_primaryCached = 0;
+}
+
 HMONITOR GetPrimaryMonitorHandle(void) {
+    if (g_primaryCached) return g_primaryMon;
     MonEnumCtx ctx = {NULL, 1};
     EnumDisplayMonitors(NULL, NULL, EnumFindMon, (LPARAM)&ctx);
-    return ctx.result;
+    g_primaryMon    = ctx.result;
+    g_primaryCached = 1;
+    return g_primaryMon;
 }
 
 int IsPrimaryMonitor(HMONITOR hMon) {

@@ -9,7 +9,7 @@
  * 参照 PowerToys GrabAndMove（ResolveTargetWindow / IsSystemClass / HandleDragMove）：
  *   - shell 钩子上报的窗口先“规范化为根顶层窗口”，并排除系统窗口
  *     （桌面 / 任务栏 / 溢出 / 提示 / 菜单 / 任务视图 / 系统浮出）；
- *   - 移动前先还原已最大化 / 最小化的窗口，否则 SetWindowPos 位置不生效。
+ *   - 移动前先还原已最大化 / 最小化的窗口（由 move.c 的 MoveWindowToMonitor 内部完成）。
  *
  * 窗口判定复用 window_filter.c 的 IsRealAppWindow()/IsExcludedWindow()，
  * 实际移动复用 move.c 的 MoveWindowToMonitor()/DelayedMove()。
@@ -27,34 +27,10 @@ static UINT  g_uShellHookMsg      = 0;   /* SHELLHOOK 动态消息号 */
 static DWORD g_lastActivationTick = 0;   /* 上次激活处理时刻（防抖） */
 static DWORD g_lastDestroyTick    = 0;   /* 上次窗口销毁时刻（防抖） */
 
-/* ─── 系统窗口类名（参照 GrabAndMove 的 IsSystemClass） ──
- * 这些窗口类不应被当作可移动的应用窗口：桌面/背景、主副任务栏、
- * 托盘溢出、提示气泡、弹出菜单、任务视图、系统浮出等。 */
-static int IsSystemClass(HWND hWnd) {
-    char cls[64] = {0};
-    if (!GetClassNameA(hWnd, cls, sizeof(cls))) return 0;
-    static const char *known[] = {
-        "Progman", "WorkerW",                        /* 桌面 / 背景 */
-        "Shell_TrayWnd", "Shell_SecondaryTrayWnd",    /* 主 / 副任务栏 */
-        "NotifyIconOverflowWindow",                   /* 托盘溢出 */
-        "TopLevelWindowForOverflowXamlIsland",
-        "tooltips_class32",                           /* 提示气泡 */
-        "#32768",                                     /* 弹出菜单 */
-        "MultitaskingViewFrame",                      /* 任务视图 Win+Tab */
-        "XamlExplorerHostIslandWindow",
-        "Windows.UI.Composition.DesktopWindowContentBridge", /* 系统浮出 */
-        "Shell_InputSwitchTopLevelWindow",            /* 输入法切换浮出 */
-        NULL
-    };
-    for (int i = 0; known[i]; i++) {
-        if (strcmp(cls, known[i]) == 0) return 1;
-    }
-    return 0;
-}
-
 /* ─── 把 shell 钩子窗口规范化为“根顶层窗口” ─────────────
  * shell 钩子有时上报子窗口；向上取根窗口，并排除本程序自身窗口
- * 与系统窗口。返回可移动的目标窗口，否则返回 NULL。 */
+ * 与系统窗口（IsSystemClass 见 window_filter.c）。返回可移动的
+ * 目标窗口，否则返回 NULL。 */
 HWND ResolveMoveTarget(HWND hWnd) {
     if (!hWnd || !IsWindow(hWnd)) return NULL;
     HWND root = GetAncestor(hWnd, GA_ROOT);
@@ -62,20 +38,6 @@ HWND ResolveMoveTarget(HWND hWnd) {
     if (hWnd == g_guiHwnd || hWnd == g_hMainWnd) return NULL;
     if (IsSystemClass(hWnd)) return NULL;
     return hWnd;
-}
-
-/* ─── 移动前还原已最小化 / 最大化的窗口 ─────────────────
- * 最大化窗口直接 SetWindowPos 不会真正移动（仍贴合原屏），
- * 需先还原为普通窗口，位置才能生效（GrabAndMove 同此做法）。 */
-static void RestoreWindowForMove(HWND hWnd) {
-    if (IsIconic(hWnd)) {
-        ShowWindow(hWnd, SW_RESTORE);
-        Sleep(60);   /* 等最小化动画结束，以便取到还原后的矩形 */
-    }
-    if (IsZoomed(hWnd)) {
-        ShowWindow(hWnd, SW_RESTORE);
-        Sleep(30);
-    }
 }
 
 /* ─── 鼠标是否在任务栏附近（含预览弹窗区域） ─────────── */
@@ -145,9 +107,7 @@ static void OnWindowActivated(HWND hWnd) {
 
     g_lastActivationTick = GetTickCount();
 
-    /* 移动前还原最小化 / 最大化窗口，否则 SetWindowPos 位置不生效 */
-    RestoreWindowForMove(hWnd);
-
+    /* 还原最小化 / 最大化由 MoveWindowToMonitor 内部完成 */
     g_movingFlag = 1;
     MoveWindowToMonitor(hWnd, hMonMouse, g_fullScreenMode);
     g_movingFlag = 0;
