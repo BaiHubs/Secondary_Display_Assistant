@@ -4,6 +4,7 @@
  *   - HSHELL_WINDOWCREATED    新窗口创建   → 若光标在副屏则延迟移动过去
  *   - HSHELL_WINDOWACTIVATED  窗口激活     → 任务栏跨屏点亮时把窗口移到光标屏
  *   - HSHELL_RUDEAPPACTIVATED 全屏应用激活 → 同上（全屏应用走此消息）
+ *   - EVENT_SYSTEM_FOREGROUND 前台切换     → 任务栏点击跨屏移动的主触发（WinEvent）
  *   - HSHELL_WINDOWDESTROYED  窗口销毁     → 记录时刻用于防抖
  *
  * 参照 PowerToys GrabAndMove（ResolveTargetWindow / IsSystemClass / HandleDragMove）：
@@ -23,9 +24,10 @@
 /* HSHELL_RUDEAPPACTIVATED 由 windows.h 提供（= 32772，全屏应用激活） */
 
 /* ─── 内部状态 ───────────────────────────────────────── */
-static UINT  g_uShellHookMsg      = 0;   /* SHELLHOOK 动态消息号 */
-static DWORD g_lastActivationTick = 0;   /* 上次激活处理时刻（防抖） */
-static DWORD g_lastDestroyTick    = 0;   /* 上次窗口销毁时刻（防抖） */
+static UINT  g_uShellHookMsg       = 0;    /* SHELLHOOK 动态消息号 */
+static DWORD g_lastActivationTick   = 0;   /* 上次激活处理时刻（防抖） */
+static DWORD g_lastDestroyTick      = 0;   /* 上次窗口销毁时刻（防抖） */
+static HWINEVENTHOOK g_hForegroundHook = NULL;  /* EVENT_SYSTEM_FOREGROUND 钩子 */
 
 /* ─── 把 shell 钩子窗口规范化为“根顶层窗口” ─────────────
  * shell 钩子有时上报子窗口；向上取根窗口，并排除本程序自身窗口
@@ -83,19 +85,16 @@ static void OnWindowCreated(HWND hWnd) {
 }
 
 /* ─── 窗口激活回调 ───────────────────────────────────── */
-/* 简单可靠：用 shell hook 的 hWnd + GetForegroundWindow 回退验证 */
-static void OnWindowActivated(HWND hWnd) {
+/* 把“新前台窗口”移到光标所在屏。触发源：shell 钩子 WINDOWACTIVATED 与
+   EVENT_SYSTEM_FOREGROUND。传入的 hWnd 即被激活 / 新前台窗口，直接使用；
+   不再用 GetForegroundWindow 覆盖——旧写法会在点击任务栏时被“尚未翻转的前台”
+   （上一个窗口）覆盖，从而对错窗口判定同屏而永不移动。 */
+static void TryMoveForegroundToCursorMonitor(HWND hWnd) {
     if (!g_isActive || !g_taskbarMoveEnabled || g_movingFlag) return;
     if (GetTickCount() - g_lastActivationTick < 300) return;
     if (GetTickCount() - g_lastDestroyTick < 200) return;
 
-    /* 规范化：shell 钩子可能上报子窗口，统一取根顶层窗口；
-       shell 钩子窗口与前台不一致时，以前台根窗口为准。 */
     hWnd = ResolveMoveTarget(hWnd);
-    {
-        HWND fgWnd = ResolveMoveTarget(GetForegroundWindow());
-        if (fgWnd && hWnd != fgWnd) hWnd = fgWnd;
-    }
     if (!hWnd || !IsRealAppWindow(hWnd)) return;
     if (!IsCursorNearTaskbar()) return;
 
@@ -113,10 +112,36 @@ static void OnWindowActivated(HWND hWnd) {
     g_movingFlag = 0;
 }
 
+/* EVENT_SYSTEM_FOREGROUND 回调（窗口激活主触发）：与 shell 钩子不同，
+   WinEvent 回调拿到的 hwnd 就是“新前台窗口”，时机可靠（点击任务栏 / Alt+Tab /
+   全屏切换都会触发，参照 GrabAndMove 用 WinEvent 捉前台）。 */
+static void CALLBACK ForegroundEventProc(HWINEVENTHOOK hWinEventHook, DWORD event,
+                                         HWND hWnd, LONG idObject, LONG idChild,
+                                         DWORD dwEventThread, DWORD dwmsEventTime) {
+    (void)hWinEventHook; (void)dwEventThread; (void)dwmsEventTime;
+    if (event != EVENT_SYSTEM_FOREGROUND) return;
+    if (idObject != OBJID_WINDOW || idChild != 0) return;
+    if (!hWnd) return;
+    TryMoveForegroundToCursorMonitor(hWnd);
+}
+
 /* ─── 注册 Shell 钩子（WM_CREATE 时调用） ────────────── */
 void ShellHookInit(HWND hWnd) {
     g_uShellHookMsg = RegisterWindowMessageA("SHELLHOOK");
     RegisterShellHookWindow(hWnd);
+    /* 前台切换钩子：任务栏点击跨屏移动的主触发。
+       WINEVENT_OUTOFCONTEXT 回调在本线程消息循环中派发，无需额外线程。 */
+    g_hForegroundHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+                                        NULL, ForegroundEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
+}
+
+/* 卸载 Shell 钩子（WM_DESTROY 时调用） */
+void ShellHookUninit(void) {
+    if (g_hForegroundHook) {
+        UnhookWinEvent(g_hForegroundHook);
+        g_hForegroundHook = NULL;
+    }
+    /* shell 钩子注册随窗口销毁自动解除，无需显式注销 */
 }
 
 /* ─── 处理 Shell 钩子消息：返回非 0 表示已处理 ───────── */
@@ -125,7 +150,7 @@ int ShellHookHandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (wParam) {
     case HSHELL_WINDOWCREATED:    OnWindowCreated((HWND)lParam); break;
     case HSHELL_WINDOWACTIVATED:
-    case HSHELL_RUDEAPPACTIVATED: OnWindowActivated((HWND)lParam); break;
+    case HSHELL_RUDEAPPACTIVATED: TryMoveForegroundToCursorMonitor((HWND)lParam); break;
     case HSHELL_WINDOWDESTROYED:  g_lastDestroyTick = GetTickCount(); break;
     }
     return 1;
