@@ -107,6 +107,7 @@ int   IsRealAppWindow(HWND hWnd);
 /* shellhook.c — Shell 钩子 */
 void  ShellHookInit(HWND hWnd);
 int   ShellHookHandleMessage(UINT msg, WPARAM wParam, LPARAM lParam);
+HWND  ResolveMoveTarget(HWND hWnd);  /* 把 shell 钩子窗口规范化为可移动的根顶层窗口 */
 
 /* hotkeys.c — 全局热键 */
 void  RegisterAppHotKeys(HWND hWnd);
